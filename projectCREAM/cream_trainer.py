@@ -191,4 +191,4 @@ class CREAMTrainer:
         dpo_file,consist=self.calculate_consistency(cur_rank,ref_rank,self.config.consistency_method)
         new_ckpt=self.consistency_regularized_training(dpo_file,current_checkpoint,f"{base}/dpo")
         self.iteration+=1
-        return new_ckpt, consis
+        return new_ckpt, consist
