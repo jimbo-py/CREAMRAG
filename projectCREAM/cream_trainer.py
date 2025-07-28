@@ -63,7 +63,7 @@ class CREAMTrainer:
             logging_steps=10,
             save_steps=500,
             save_total_limit=1,
-            remove_unused_columns=False,
+            remove_unused_columns=True,
             prediction_loss_only=True
         )
         trainer = Trainer(model=model, args=args, train_dataset=tokenized, tokenizer=self.tokenizer)
@@ -79,7 +79,11 @@ class CREAMTrainer:
         for q in prompts:
             if retriever:
                 ctxs = retriever.retrieve(q)
-                full = f"Context:\n" + "\n".join(ctxs) + f"\n\nQuestion: {q}"
+                full = f"Context:
+" + "
+".join(ctxs) + f"
+
+Question: {q}"
             else:
                 full = q
             inp = self.tokenizer(full, return_tensors='pt', truncation=True,
@@ -99,7 +103,10 @@ class CREAMTrainer:
         return output_file
 
     def _score_response_with_model(self, model, prompt, response):
-        txt=f"Human: {prompt}\nAssistant: {response}\n\nRate this response quality (1-10):"
+        txt=f"Human: {prompt}
+Assistant: {response}
+
+Rate this response quality (1-10):"
         inp=self.tokenizer(txt, return_tensors='pt', truncation=True,
                            max_length=self.config.max_length).to(self.device)
         with torch.no_grad():
@@ -110,7 +117,6 @@ class CREAMTrainer:
                 probs=F.softmax(logits[ids],dim=0)
                 weights=torch.arange(1,len(ids)+1,dtype=torch.float32,device=self.device)
                 return (probs*weights).sum().item()
-        # fallback
         full=prompt+response
         inp=self.tokenizer(full,return_tensors='pt',truncation=True).to(self.device)
         out=model(**inp)
@@ -169,7 +175,7 @@ class CREAMTrainer:
             per_device_train_batch_size=self.config.batch_size,
             learning_rate=self.config.learning_rate,
             beta=self.config.dpo_beta,
-            remove_unused_columns=False
+            remove_unused_columns=True
         )
         trainer=DPOTrainer(model=model,args=cfg,train_dataset=dataset,tokenizer=self.tokenizer)
         trainer.train(); trainer.save_model()
@@ -187,7 +193,10 @@ class CREAMTrainer:
         samp_file=f"{base}/sampling.json"
         self.response_sampling(prompts,current_checkpoint,samp_file,retriever)
         cur_rank=self.response_ranking(samp_file,current_checkpoint,False,"current")
-        ref_rank=self.response_ranking(samp_file,reference_checkpoint,True,"reference")
+        if reference_checkpoint:
+            ref_rank=self.response_ranking(samp_file,reference_checkpoint,True,"reference")
+        else:
+            ref_rank=cur_rank
         dpo_file,consist=self.calculate_consistency(cur_rank,ref_rank,self.config.consistency_method)
         new_ckpt=self.consistency_regularized_training(dpo_file,current_checkpoint,f"{base}/dpo")
         self.iteration+=1
