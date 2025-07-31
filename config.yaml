@@ -1,0 +1,23 @@
+device: cpu  # or "cuda" if you have GPU
+
+retriever:
+  document_path: data/corpus.jsonl        # JSONL file or JSON list of docs
+  embedding_path: index_embeddings/doc_embeddings.npy  # Torch tensor file
+  max_doc_length: 500
+  top_k: 5                               # Number of docs to retrieve
+
+generator:
+  model: gpt2                           # HuggingFace model name
+  max_new_tokens: 100
+
+reward_model:
+  model: distilbert-base-uncased-finetuned-sst-2-english
+
+training:
+  learning_rate: 1e-5
+  lambda_consistency: 0.1
+  epochs: 5
+  log_interval: 1
+  max_questions_from_corpus: 2000  # Generate more questions
+  direct_document_training: true  # Enable direct document training
+  
