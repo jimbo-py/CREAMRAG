@@ -1,3 +1,4 @@
+
 device: cpu  # or "cuda" if you have GPU
 
 retriever:
@@ -20,4 +21,5 @@ training:
   log_interval: 1
   max_questions_from_corpus: 2000  # Generate more questions
   direct_document_training: true  # Enable direct document training
+
   
