@@ -8,7 +8,7 @@ from sentence_transformers import SentenceTransformer
 
 # === CONFIGURATION ===
 CORPUS_PATH = "data/corpus.jsonl"  # Each line: {"id": ..., "text": ...}
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+EMBEDDING_MODEL = "meta-llama/Llama-2-7b-chat-hf"
 INDEX_DIR = "index_embeddings"
 
 def load_corpus(path):
@@ -47,4 +47,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
