@@ -1,41 +1,45 @@
-
 import yaml
 import os
 import torch
-from agent.rag_retriever import FlexRAGRetriever
-from agent.generator import LLMGenerator
-from agent.reward_model import RewardModel
-from agent.consistency import Consistency
+from agent.rag_retriever import LlamaRetriever
+from agent.generator import LlamaGenerator
+from agent.reward_model import RAGCreamRewardSystem, RewardModel
+from agent.consistency import ConsistencyEvaluator, ConsistencyMethodEnum
 import numpy as np
 from transformers import AutoModelForCausalLM
 from torch.optim import Adam
 import json
 import random
+from huggingface_hub import login
+
+
+login(token = "")
+
 
 def load_documents(path):
     """Load documents from JSON or JSONL file"""
+    
+    documents = []
     if path.endswith('.jsonl'):
-        documents = []
         with open(path, 'r', encoding='utf-8') as f:
             for line in f:
                 obj = json.loads(line)
-                # Handle your corpus format with 'id' and 'text' fields
-                text = obj.get("text", "")
+                text = obj.get("text") or obj.get("document") or obj.get("content")
                 if text:
                     documents.append(text)
-        return documents
     else:
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
             if isinstance(data, list):
-                documents = []
                 for item in data:
-                    if isinstance(item, dict):
-                        text = item.get("text", "")
+                    if isinstance(item, str):
+                        documents.append(item)
+                    elif isinstance(item, dict):
+                        text = item.get("text") or item.get("document") or item.get("content")
                         if text:
                             documents.append(text)
-                return documents
-            return data
+   
+    return documents
 
 def load_questions(path):
     """Load training questions from JSON or JSONL file"""
@@ -143,7 +147,7 @@ def create_questions_from_all_documents(documents, max_questions=1000):
     return questions
 
 def main():
-    config_path = r"C:\Users\lavai\Downloads\creamtestingstuff\config.yaml"
+    config_path = r"C:\Users\lavai\Downloads\CREAMRAG\config.yaml"
     
     print(f"Looking for config file at: {config_path}")
     if not os.path.isfile(config_path):
@@ -156,11 +160,64 @@ def main():
     if "device" not in config:
         raise KeyError("Missing 'device' key in config.yaml")
     
-    device = torch.device(config["device"])
-    print(f"Using device: {device}")
+    # Handle device configuration with fallback to CPU
+    requested_device = config["device"]
     
-    # Load documents and questions
-    documents = None
+    if requested_device == "cuda" or requested_device.startswith("cuda:"):
+        if torch.cuda.is_available():
+            device = torch.device(requested_device)
+            print(f"Using device: {device}")
+        else:
+            print(f"WARNING: CUDA requested ({requested_device}) but not available.")
+            print("PyTorch may not be compiled with CUDA support or no GPU available.")
+            print("Falling back to CPU.")
+            device = torch.device("cpu")
+    else:
+        device = torch.device(requested_device)
+        print(f"Using device: {device}")
+    
+    # Get document path from config
+    doc_path = config["retriever"]["document_path"]
+    print(f"Looking for document file at: {doc_path}")
+    
+    # Check if the configured path exists, if not try common alternatives
+    if not os.path.exists(doc_path):
+        print(f"Document file not found at {doc_path}")
+        
+        # Try common alternatives
+        alternatives = [
+            "corpus.jsonl",
+            "data/corpus.jsonl", 
+            "documents.jsonl",
+            "data/documents.jsonl",
+            "corpus.json",
+            "documents.json"
+        ]
+        
+        found_file = None
+        for alt_path in alternatives:
+            if os.path.exists(alt_path):
+                found_file = alt_path
+                print(f"Found document file at: {alt_path}")
+                break
+        
+        if found_file:
+            doc_path = found_file
+        else:
+            print("Available files in current directory:")
+            for file in os.listdir("."):
+                if file.endswith(('.json', '.jsonl')):
+                    print(f"  - {file}")
+            raise FileNotFoundError(f"Could not find document file. Tried: {doc_path} and alternatives: {alternatives}")
+    
+    # Load documents
+    documents = load_documents(doc_path)
+    print(f"Loaded {len(documents)} documents")
+    
+    if len(documents) == 0:
+        raise ValueError("No documents loaded! Check your document file format.")
+    
+    # Load or create questions
     questions = None
     
     # Check if there's a separate questions file in config
@@ -171,29 +228,159 @@ def main():
             print(f"Loaded {len(questions)} questions from separate file")
         else:
             print(f"Questions file not found at {questions_path}, creating questions from corpus")
-            max_questions = config["training"].get("max_questions_from_corpus", 1000)
-            questions = create_questions_from_all_documents(documents, max_questions)
-    
-    # Load documents
-    documents = load_documents(config["retriever"]["document_path"])
-    print(f"Loaded {len(documents)} documents")
     
     # If no separate questions file, create questions from all documents
     if questions is None:
         max_questions = config["training"].get("max_questions_from_corpus", 1000)
         questions = create_questions_from_all_documents(documents, max_questions)
-        print(f"Created {len(questions)} questions from corpus content (covers more documents)")
+        print(f"Created {len(questions)} questions from corpus content")
+    
+    if len(questions) == 0:
+        raise ValueError("No questions available for training!")
     
     print(f"Training with {len(questions)} questions")
     
     # Load embeddings
-    index_embeddings = load_embeddings(config["retriever"]["embedding_path"]).to(device)
+    embedding_path = config["retriever"]["embedding_path"]
+    if not os.path.exists(embedding_path):
+        raise FileNotFoundError(f"Embedding file not found at: {embedding_path}")
+    
+    index_embeddings = load_embeddings(embedding_path).to(device)
     print(f"Loaded index embeddings with shape {index_embeddings.shape}")
     
-    # Initialize components
-    retriever = FlexRAGRetriever(documents, index_embeddings, device)
-    generator = LLMGenerator(config["generator"]["model"], device)
-    reward_model = RewardModel(config["reward_model"]["model"], device)
+    # Verify embeddings match documents
+    if index_embeddings.shape[0] != len(documents):
+        print(f"WARNING: Mismatch between embeddings ({index_embeddings.shape[0]}) and documents ({len(documents)})")
+        print("This might cause retrieval issues.")
+    
+    # Initialize components with correct parameters
+    device_str = str(device)  # Ensure we have a string representation
+    
+    print(f"Initializing retriever with device: {device_str}")
+    print(f"Documents count: {len(documents)}")
+    print(f"Embeddings shape: {index_embeddings.shape}")
+    print(f"Embeddings device: {index_embeddings.device}")
+    print(f"Target device: {device}")
+    
+    # Initialize LlamaRetriever with correct parameters - FIXED: Disable flash attention
+    print("Initializing LlamaRetriever...")
+    retriever_model_name = config["retriever"].get("model", "meta-llama/Llama-2-7b-hf")
+    retriever = LlamaRetriever(
+        model_name=retriever_model_name,
+        device=device_str,
+        max_length=config["retriever"].get("max_length", 512),
+        use_4bit=config["retriever"].get("use_4bit", False),  # Fixed: Set to False to avoid deprecated warning
+        use_8bit=config["retriever"].get("use_8bit", True),
+        use_flash_attention=False  # Fixed: Disabled flash attention to avoid ImportError
+    )
+    
+    # Set documents and embeddings after initialization
+    if hasattr(retriever, 'set_documents'):
+        retriever.set_documents(documents)
+    else:
+        retriever.documents = documents
+        
+    if hasattr(retriever, 'set_embeddings'):
+        retriever.set_embeddings(index_embeddings)
+    else:
+        retriever.index_embeddings = index_embeddings
+        
+    print("✅ Retriever initialized successfully")
+    
+    print("Initializing generator...")
+    try:
+        generator = LlamaGenerator(
+            model_name=config["generator"]["model"],  # from config.yaml
+            device=device_str,  # Use device_str instead of config["device"]
+            max_length=config["training"]["max_input_length"],
+            temperature=config["generator"]["temperature"],
+            use_4bit=False,  # Fixed: Disable 4bit to avoid deprecation warning
+            use_8bit=False,   # Fixed: Also disable 8bit to avoid GPU memory issues
+            use_flash_attention=False  # Fixed: Disable flash attention to avoid ImportError
+        )
+    except Exception as e:
+        print(f"Failed to initialize generator with optimizations: {e}")
+        print("Trying basic initialization...")
+        # Fallback: try with basic parameters
+        generator = LlamaGenerator(
+            model_name=config["generator"]["model"],
+            device=device_str,
+            max_length=config["training"]["max_input_length"],
+            temperature=config["generator"]["temperature"]
+        )
+
+    
+    print("Initializing reward model...")
+    # Load reward model components separately
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    
+    reward_model_name = config["reward_model"]["model"]
+    print(f"Loading reward model: {reward_model_name}")
+    
+    # Load reward model tokenizer
+    reward_tokenizer = AutoTokenizer.from_pretrained(reward_model_name)
+    if reward_tokenizer.pad_token is None:
+        reward_tokenizer.pad_token = reward_tokenizer.eos_token
+    
+    # Load reward model with basic configuration (no quantization to avoid memory issues)
+    try:
+        reward_model_base = AutoModelForCausalLM.from_pretrained(
+            reward_model_name,
+            torch_dtype=torch.float16,
+            device_map="auto"
+        )
+    except Exception as e:
+        print(f"Failed to load reward model with device_map=auto: {e}")
+        print("Trying basic loading...")
+        reward_model_base = AutoModelForCausalLM.from_pretrained(
+            reward_model_name,
+            torch_dtype=torch.float16
+        ).to(device)
+    
+    # Initialize the RewardModel class with proper parameters
+    reward_model_wrapper = RewardModel(
+        model=reward_model_base,
+        tokenizer=reward_tokenizer, 
+        device=device
+    )
+    
+    # Create a simple wrapper to match the expected interface
+    class SimpleRewardModel:
+        def __init__(self, reward_model, tokenizer):
+            self.reward_model = reward_model
+            self.tokenizer = tokenizer
+            
+        def compute_reward(self, prompt, response):
+            """Simple reward computation using the loaded model"""
+            try:
+                # Create a simple conversation format
+                conversation = [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": response}
+                ]
+                
+                # Simple tokenization and forward pass
+                text = f"Human: {prompt}\nAssistant: {response}"
+                inputs = self.tokenizer(
+                    text, 
+                    return_tensors="pt", 
+                    truncation=True, 
+                    max_length=512
+                ).to(self.reward_model.device)
+                
+                with torch.no_grad():
+                    outputs = self.reward_model.model(**inputs)
+                    # Simple reward calculation based on perplexity
+                    loss = outputs.loss if hasattr(outputs, 'loss') else torch.tensor(0.0)
+                    # Return negative loss as reward (lower loss = higher reward)
+                    reward = -loss.item() if loss.numel() > 0 else 0.5
+                    
+                return reward
+            except Exception as e:
+                print(f"Warning: Reward computation failed: {e}")
+                return 0.5  # Default neutral reward
+    
+    reward_model = SimpleRewardModel(reward_model_wrapper, reward_tokenizer)
     
     generator.tokenizer.pad_token = generator.tokenizer.eos_token
     
@@ -201,7 +388,7 @@ def main():
     tokenizer = generator.tokenizer
     ref_model = AutoModelForCausalLM.from_pretrained(config["generator"]["model"]).to(device)
     ref_model.eval()
-    consistency = Consistency(generator.model, ref_model, tokenizer)
+    consistency = ConsistencyEvaluator(generator.model, ref_model, tokenizer)
     
     learning_rate = float(config["training"]["learning_rate"])
     optimizer = Adam(generator.model.parameters(), lr=learning_rate)
@@ -268,9 +455,17 @@ def main():
                 question_tokens = len(tokenizer.encode(question_part))
                 available_context_tokens = max_input_length - question_tokens - 10  # safety margin
                 
-                context_tokens = tokenizer.encode(f"Context:\n{context}")[:available_context_tokens]
-                truncated_context = tokenizer.decode(context_tokens, skip_special_tokens=True)
-                full_prompt = f"{truncated_context}...{question_part}"
+                if training_mode == "direct":
+                    # For direct training, truncate the document part
+                    doc_part = full_prompt.split("\n\nQuestion:")[0]
+                    context_tokens = tokenizer.encode(doc_part)[:available_context_tokens]
+                    truncated_context = tokenizer.decode(context_tokens, skip_special_tokens=True)
+                    full_prompt = f"{truncated_context}...{question_part}"
+                else:
+                    # For retrieval training, truncate context
+                    context_tokens = tokenizer.encode(f"Context:\n{context}")[:available_context_tokens]
+                    truncated_context = tokenizer.decode(context_tokens, skip_special_tokens=True)
+                    full_prompt = f"{truncated_context}...{question_part}"
             
             # Generate response with reduced max tokens to prevent overflow
             max_tokens = min(config["generator"].get("max_new_tokens", 100), 150)  # Cap at 150
