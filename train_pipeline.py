@@ -143,7 +143,7 @@ def create_questions_from_all_documents(documents, max_questions=1000):
     return questions
 
 def main():
-    config_path = r"C:\Users\lavai\Downloads\creamtestingstuff\config.yaml"
+    config_path = r"/root/CREAMRAG-2/config.yaml"
     
     print(f"Looking for config file at: {config_path}")
     if not os.path.isfile(config_path):

@@ -1,5 +1,5 @@
 
-device: cpu  # or "cuda" if you have GPU
+device: cuda  # or "cuda" if you have GPU
 
 retriever:
   document_path: data/corpus.jsonl        # JSONL file or JSON list of docs
