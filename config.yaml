@@ -1,25 +1,66 @@
+# RAG Cream Training Configuration
 
-device: cpu  # or "cuda" if you have GPU
+# Device configuration
+device: "cuda:0"  # or "cpu"
 
+# Retriever configuration
 retriever:
-  document_path: data/corpus.jsonl        # JSONL file or JSON list of docs
-  embedding_path: index_embeddings/doc_embeddings.npy  # Torch tensor file
-  max_doc_length: 500
-  top_k: 5                               # Number of docs to retrieve
+  document_path: "data/corpus.jsonl"  # Path to your document corpus
+  embedding_path: "index_embeddings/doc_embeddings.npy"  # Path to precomputed embeddings
+  top_k: 5  # Number of documents to retrieve
 
+# Generator (LLM) configuration
 generator:
-  model: gpt2                           # HuggingFace model name
-  max_new_tokens: 100
+  model: "meta-llama/Llama-2-7b-chat-hf"  # Your LLaMA model path
+  max_new_tokens: 256
+  temperature: 0.7
 
+# Reward model configuration
 reward_model:
-  model: distilbert-base-uncased-finetuned-sst-2-english
+  model: "meta-llama/Llama-2-7b-chat-hf"  # Can be same as generator
 
+# Training configuration
 training:
+  # Basic parameters
+  epochs: 10
   learning_rate: 1e-5
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  
+  # Model parameters
+  max_input_length: 1024
+  max_new_tokens: 256
+  temperature: 0.7
+  
+  # Loss weights
   lambda_consistency: 0.1
-  epochs: 5
-  log_interval: 1
-  max_questions_from_corpus: 2000  # Generate more questions
-  direct_document_training: true  # Enable direct document training
+  lambda_reward: 1.0
+  lambda_retrieval: 0.05
+  
+  # Training strategies
+  use_direct_document_training: true
+  direct_training_ratio: 0.3
+  top_k_variance: true
+  
+  # Optional: separate questions file
+  # questions_path: "data/questions.json"
+  
+  # Data parameters
+  max_questions_from_corpus: 1000
+  context_length_limit: 800
+  document_truncation_limit: 500
+  
+  # Optimizer settings
+  optimizer: "adamw"  # or "adam"
+  weight_decay: 0.01
+  scheduler: "cosine"  # or "linear" or null
+  
+  # Logging and saving
+  log_interval: 10
+  eval_interval: 100
+  save_interval: 2
+  save_path: "checkpoints/rag_cream"
+  
 
   
