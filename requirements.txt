@@ -10,4 +10,8 @@ peft
 colbert-ai  # If using ColBERT retrieval
 PyYAML
 numpy
-
+loguru
+bitsandbytes
+accelerate
+simple_parsing
+huggingface_hub

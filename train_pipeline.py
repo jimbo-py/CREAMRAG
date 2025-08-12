@@ -11,6 +11,18 @@ from torch.optim import Adam
 import json
 import random
 from huggingface_hub import login
+import torch, gc
+
+try:
+    from bitsandbytes.optim import AdamW8bit
+    _USE_BNB = True
+except Exception:
+    from torch.optim import AdamW as TorchAdamW
+    _USE_BNB = False
+
+
+gc.collect()
+torch.cuda.empty_cache()
 
 
 login(token = "")
@@ -147,7 +159,7 @@ def create_questions_from_all_documents(documents, max_questions=1000):
     return questions
 
 def main():
-    config_path = r"C:\Users\lavai\Downloads\CREAMRAG\config.yaml"
+    config_path = r"/root/CREAMRAG-1/config.yaml"
     
     print(f"Looking for config file at: {config_path}")
     if not os.path.isfile(config_path):
@@ -212,7 +224,7 @@ def main():
     
     # Load documents
     documents = load_documents(doc_path)
-    print(f"Loaded {len(documents)} documents")
+    print(f"Loaded {len(documents)}     ")
     
     if len(documents) == 0:
         raise ValueError("No documents loaded! Check your document file format.")
@@ -266,12 +278,19 @@ def main():
     print("Initializing LlamaRetriever...")
     retriever_model_name = config["retriever"].get("model", "meta-llama/Llama-2-7b-hf")
     retriever = LlamaRetriever(
-        model_name=retriever_model_name,
-        device=device_str,
+        model_name="ignored-for-st",
+        device=device_str,                              # e.g., "cuda" or "cpu"
         max_length=config["retriever"].get("max_length", 512),
-        use_4bit=config["retriever"].get("use_4bit", False),  # Fixed: Set to False to avoid deprecated warning
-        use_8bit=config["retriever"].get("use_8bit", True),
-        use_flash_attention=False  # Fixed: Disabled flash attention to avoid ImportError
+        use_4bit=False,
+        use_8bit=False,
+        use_flash_attention=False,
+        backend="st",                                   # <-- key change
+        st_model_name="intfloat/e5-base-v2",            # <-- must match your builder
+    )
+
+    retriever.load_index_from_components(
+        index_dir="index_embeddings",      # where faiss_index.bin & doc_ids.json live
+        corpus_path="data/corpus.jsonl",   # same corpus you embedded
     )
     
     # Set documents and embeddings after initialization
@@ -349,36 +368,56 @@ def main():
         def __init__(self, reward_model, tokenizer):
             self.reward_model = reward_model
             self.tokenizer = tokenizer
-            
-        def compute_reward(self, prompt, response):
-            """Simple reward computation using the loaded model"""
+            self.reward_model.model.eval()
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        def compute_reward(self, prompt: str, response: str) -> float:
             try:
-                # Create a simple conversation format
-                conversation = [
-                    {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": response}
-                ]
-                
-                # Simple tokenization and forward pass
-                text = f"Human: {prompt}\nAssistant: {response}"
-                inputs = self.tokenizer(
-                    text, 
-                    return_tensors="pt", 
-                    truncation=True, 
-                    max_length=512
-                ).to(self.reward_model.device)
-                
+                enc_p = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+                enc_r = self.tokenizer(response, return_tensors="pt", truncation=True, max_length=256)
+
+                input_ids = torch.cat([enc_p["input_ids"], enc_r["input_ids"]], dim=1)
+                attention = torch.cat([enc_p["attention_mask"], enc_r["attention_mask"]], dim=1)
+
+                labels = input_ids.clone()
+                labels[:, :enc_p["input_ids"].shape[1]] = -100
+
+                # dtypes
+                input_ids = input_ids.long()
+                labels    = labels.long()
+                attention = attention.long()
+
+                # device
+                dev = next(self.reward_model.model.parameters()).device
+                input_ids = input_ids.to(dev, non_blocking=True)
+                labels    = labels.to(dev, non_blocking=True)
+                attention = attention.to(dev, non_blocking=True)
+
+                # sanity: label range must be in [0, vocab_size) or -100
+                vocab_size = self.reward_model.model.get_output_embeddings().weight.shape[0]
+                masked = labels[labels != -100]
+                if masked.numel() > 0:
+                    mx, mn = int(masked.max().item()), int(masked.min().item())
+                    if mn < 0 or mx >= vocab_size:
+                        print(f"[REWARD] bad label range: min={mn}, max={mx}, vocab={vocab_size}")
+                        # abort scoring this sample
+                        return 0.0
+
                 with torch.no_grad():
-                    outputs = self.reward_model.model(**inputs)
-                    # Simple reward calculation based on perplexity
-                    loss = outputs.loss if hasattr(outputs, 'loss') else torch.tensor(0.0)
-                    # Return negative loss as reward (lower loss = higher reward)
-                    reward = -loss.item() if loss.numel() > 0 else 0.5
-                    
-                return reward
+                    out = self.reward_model.model(
+                        input_ids=input_ids,
+                        attention_mask=attention,
+                        labels=labels,
+                        return_dict=True,
+                    )
+                    loss = out.loss
+
+                return float(-loss.item())
             except Exception as e:
-                print(f"Warning: Reward computation failed: {e}")
-                return 0.5  # Default neutral reward
+                print(f"Warning: Reward computation failed cleanly: {e}")
+                return 0.0
+
     
     reward_model = SimpleRewardModel(reward_model_wrapper, reward_tokenizer)
     
@@ -386,12 +425,31 @@ def main():
     
     # Prepare frozen reference model for consistency loss
     tokenizer = generator.tokenizer
-    ref_model = AutoModelForCausalLM.from_pretrained(config["generator"]["model"]).to(device)
+    # ref_model = AutoModelForCausalLM.from_pretrained(config["generator"]["model"]).to(device)
+    ref_model = AutoModelForCausalLM.from_pretrained(
+    config["generator"]["model"],
+    torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+    low_cpu_mem_usage=True,
+)
     ref_model.eval()
     consistency = ConsistencyEvaluator(generator.model, ref_model, tokenizer)
     
     learning_rate = float(config["training"]["learning_rate"])
-    optimizer = Adam(generator.model.parameters(), lr=learning_rate)
+
+    if _USE_BNB and device_str.startswith("cuda"):
+        # 8-bit AdamW cuts optimizer state VRAM massively
+        optimizer = AdamW8bit(
+            generator.model.parameters(),
+            lr=learning_rate,
+            weight_decay=float(config["training"].get("weight_decay", 0.0)),
+        )
+    else:
+        # Fallback (CPU or no bnb). Still better than Adam: AdamW + set_to_none
+        optimizer = TorchAdamW(
+            generator.model.parameters(),
+            lr=learning_rate,
+            weight_decay=float(config["training"].get("weight_decay", 0.0)),
+        )
     
     # Training loop
     for epoch in range(config["training"]["epochs"]):
