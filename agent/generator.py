@@ -132,7 +132,8 @@ class LlamaGenerator:
         
         # Generate
         with torch.no_grad():
-            outputs = self.model.generate(
+            model_for_generate = self.model.module if hasattr(self.model, 'module') else self.model
+            outputs = model_for_generate.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
@@ -173,7 +174,8 @@ class LlamaGenerator:
         
         # Generate
         with torch.no_grad():
-            outputs = self.model.generate(
+            model_for_generate = self.model.module if hasattr(self.model, 'module') else self.model
+            outputs = model_for_generate.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,

@@ -24,13 +24,13 @@ training:
   # Basic parameters
   epochs: 10
   learning_rate: 1e-5
-  batch_size: 4
+  batch_size: 1
   gradient_accumulation_steps: 4
   max_grad_norm: 1.0
   
   # Model parameters
   max_input_length: 1024
-  max_new_tokens: 256
+  max_new_tokens: 128
   temperature: 0.7
   
   # Loss weights

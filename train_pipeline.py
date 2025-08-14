@@ -159,7 +159,7 @@ def create_questions_from_all_documents(documents, max_questions=1000):
     return questions
 
 def main():
-    config_path = r"/root/CREAMRAG-1/config.yaml"
+    config_path = r"/root/CREAMRAG/config.yaml"
     
     print(f"Looking for config file at: {config_path}")
     if not os.path.isfile(config_path):
@@ -397,10 +397,15 @@ def main():
                 # sanity: label range must be in [0, vocab_size) or -100
                 vocab_size = self.reward_model.model.get_output_embeddings().weight.shape[0]
                 masked = labels[labels != -100]
+                print(f"[DEBUG] labels shape: {labels.shape}, dtype: {labels.dtype}")
+                print(f"[DEBUG] labels min: {masked.min().item() if masked.numel() > 0 else 'N/A'}")
+                print(f"[DEBUG] labels max: {masked.max().item() if masked.numel() > 0 else 'N/A'}")
+                print(f"[DEBUG] vocab_size: {vocab_size}")
                 if masked.numel() > 0:
-                    mx, mn = int(masked.max().item()), int(masked.min().item())
-                    if mn < 0 or mx >= vocab_size:
-                        print(f"[REWARD] bad label range: min={mn}, max={mx}, vocab={vocab_size}")
+                    out_of_range = masked[(masked < 0) | (masked >= vocab_size)]
+                    if out_of_range.numel() > 0:
+                        print(f"[REWARD] out-of-range label values: {out_of_range}")
+                        print(f"[REWARD] bad label range: min={masked.min().item()}, max={masked.max().item()}, vocab={vocab_size}")
                         # abort scoring this sample
                         return 0.0
 
@@ -427,11 +432,21 @@ def main():
     tokenizer = generator.tokenizer
     # ref_model = AutoModelForCausalLM.from_pretrained(config["generator"]["model"]).to(device)
     ref_model = AutoModelForCausalLM.from_pretrained(
-    config["generator"]["model"],
-    torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-    low_cpu_mem_usage=True,
-)
+        config["generator"]["model"],
+        torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+        low_cpu_mem_usage=True,
+    )
     ref_model.eval()
+
+    # Enable multi-GPU for generator and ref_model
+    if torch.cuda.device_count() > 1:
+        print("Using", torch.cuda.device_count(), "GPUs for generator!")
+        generator.model = torch.nn.DataParallel(generator.model)
+        print("Using", torch.cuda.device_count(), "GPUs for ref_model!")
+        ref_model = torch.nn.DataParallel(ref_model)
+    generator.model = generator.model.cuda()
+    ref_model = ref_model.cuda()
+
     consistency = ConsistencyEvaluator(generator.model, ref_model, tokenizer)
     
     learning_rate = float(config["training"]["learning_rate"])
