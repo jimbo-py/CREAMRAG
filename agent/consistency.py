@@ -1,328 +1,229 @@
-"""
-Consistency Reward Module for PPO Training
-Integrates CREAM consistency evaluation with PPO reward computation
-"""
+# ppo_cream_train.py
+# PPO + CREAM (online) for RAG, mirroring your offline math.
+# - Reward: avg log-likelihood over response tokens only (length-normalized)
+# - Consistency: Spearman/Kendall between policy-vs-ref reward lists on K candidates (scaled to [0,1])
+# - DPO-style delta optional: policy_reward - ref_reward for the chosen response
+#
+# Requirements:
+#   pip install torch transformers trl scipy datasets accelerate
+#
+# Notes:
+# - If VRAM is tight, set load_in_8bit=True (bitsandbytes needed) or use device_map="auto".
+# - Keep K small (e.g., 2–4) to control compute.
+# - Plug in your own retriever where indicated.
+
+from dataclasses import dataclass
+from typing import List, Optional, Literal, Tuple, Dict
+import math
+import random
 
 import torch
 import torch.nn.functional as F
-import numpy as np
-from typing import List, Dict, Optional, Tuple
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer, AutoModelForCausalLM, set_seed
+from trl import PPOConfig, PPOTrainer
+
 from scipy.stats import spearmanr, kendalltau, rankdata
-import logging
 
-logger = logging.getLogger(__name__)
+# ----------------------------
+# Config
+# ----------------------------
 
-class ConsistencyRewardModel:
-    """Reward model that combines likelihood and consistency rewards"""
-    
-    def __init__(
-        self,
-        base_model,
-        tokenizer,
-        device,
-        lambda_consistency: float = 0.5,
-        consistency_method: str = "spearman",
-        num_candidates: int = 3,
-        normalize_by_length: bool = True
-    ):
-        self.base_model = base_model
-        self.tokenizer = tokenizer
-        self.device = device
-        self.lambda_consistency = lambda_consistency
-        self.consistency_method = consistency_method
-        self.num_candidates = num_candidates
-        self.normalize_by_length = normalize_by_length
-        
-        # Set model to eval mode
-        self.base_model.eval()
-    
-    def compute_likelihood_reward(self, prompt: str, response: str) -> float:
-        """Compute likelihood-based reward for a single response"""
-        try:
-            # Tokenize prompt and response
-            prompt_inputs = self.tokenizer(
-                prompt, 
-                return_tensors="pt", 
-                truncation=True, 
-                max_length=512
-            ).to(self.device)
-            
-            full_text = prompt + response
-            full_inputs = self.tokenizer(
-                full_text,
-                return_tensors="pt",
-                truncation=True,
-                max_length=1024
-            ).to(self.device)
-            
-            prompt_length = prompt_inputs['input_ids'].shape[1]
-            
-            # Forward pass
-            with torch.no_grad():
-                outputs = self.base_model(**full_inputs)
-                logits = outputs.logits[0, prompt_length-1:-1, :]  # Response tokens only
-                response_ids = full_inputs['input_ids'][0, prompt_length:]
-                
-                # Compute log probabilities
-                log_probs = F.log_softmax(logits, dim=-1)
-                token_log_probs = torch.gather(
-                    log_probs, 1, response_ids.unsqueeze(1)
-                ).squeeze(1)
-                
-                # Sum log probabilities
-                total_log_prob = token_log_probs.sum()
-                
-                # Normalize by length if requested
-                if self.normalize_by_length:
-                    total_log_prob /= token_log_probs.shape[0]
-                
-                return total_log_prob.item()
-                
-        except Exception as e:
-            logger.warning(f"Likelihood reward computation failed: {e}")
-            return 0.0
-    
-    def generate_candidates(self, prompt: str, max_new_tokens: int = 128) -> List[str]:
-        """Generate multiple candidate responses for consistency evaluation"""
-        candidates = []
-        
-        for _ in range(self.num_candidates):
-            try:
-                inputs = self.tokenizer(
-                    prompt,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=512
-                ).to(self.device)
-                
-                with torch.no_grad():
-                    outputs = self.base_model.generate(
-                        **inputs,
-                        max_new_tokens=max_new_tokens,
-                        temperature=0.8,
-                        do_sample=True,
-                        pad_token_id=self.tokenizer.eos_token_id,
-                        eos_token_id=self.tokenizer.eos_token_id
-                    )
-                
-                # Decode response
-                response = self.tokenizer.decode(
-                    outputs[0][inputs['input_ids'].shape[1]:],
-                    skip_special_tokens=True
-                )
-                candidates.append(response.strip())
-                
-            except Exception as e:
-                logger.warning(f"Candidate generation failed: {e}")
-                candidates.append("")
-        
-        return candidates
-    
-    def compute_consistency_reward(self, prompt: str, response: str) -> float:
-        """Compute consistency reward by comparing rankings"""
-        try:
-            # Generate candidates
-            candidates = self.generate_candidates(prompt)
-            if len(candidates) < 2:
-                return 0.0
-            
-            # Add the actual response to candidates
-            all_candidates = candidates + [response]
-            
-            # Score all candidates with base model
-            scores = []
-            for candidate in all_candidates:
-                score = self.compute_likelihood_reward(prompt, candidate)
-                scores.append(score)
-            
-            # Ensure we have enough scores
-            if len(scores) < 2:
-                return 0.0
-            
-            # Create two ranking scenarios:
-            # 1. Base model ranking (reference)
-            # 2. Current policy ranking (assuming response is best)
-            
-            # Reference ranking (base model scores)
-            ref_scores = scores[:-1]  # Exclude the actual response
-            if len(ref_scores) < 2:
-                return 0.0
-                
-            ref_ranks = rankdata(ref_scores, method='ordinal')
-            
-            # Policy ranking (assume response is ranked first)
-            policy_scores = scores[:-1] + [scores[-1]]  # Put response first
-            policy_ranks = rankdata(policy_scores, method='ordinal')
-            
-            # Ensure arrays have the same length for correlation
-            if len(ref_ranks) != len(policy_ranks):
-                # Pad the shorter array
-                min_len = min(len(ref_ranks), len(policy_ranks))
-                ref_ranks = ref_ranks[:min_len]
-                policy_ranks = policy_ranks[:min_len]
-            
-            # Compute consistency between rankings
-            if self.consistency_method == "spearman":
-                if len(ref_ranks) >= 2:
-                    consistency, _ = spearmanr(ref_ranks, policy_ranks)
-                else:
-                    consistency = 0.0
-            elif self.consistency_method == "kendall":
-                if len(ref_ranks) >= 2:
-                    consistency, _ = kendalltau(ref_ranks, policy_ranks)
-                else:
-                    consistency = 0.0
-            elif self.consistency_method == "toporder":
-                # Check if top and bottom rankings match
-                if len(ref_scores) >= 2:
-                    ref_top = np.argmax(ref_scores)
-                    ref_bottom = np.argmin(ref_scores)
-                    policy_top = np.argmax(policy_scores)
-                    policy_bottom = np.argmin(policy_scores)
-                    consistency = 1.0 if (ref_top == policy_top and ref_bottom == policy_bottom) else 0.0
-                else:
-                    consistency = 0.0
-            else:
-                raise ValueError(f"Unsupported consistency method: {self.consistency_method}")
-            
-            # Handle NaN values
-            if np.isnan(consistency):
-                consistency = 0.0
-            
-            # Scale from [-1, 1] to [0, 1] for spearman and kendall
-            if self.consistency_method in ["spearman", "kendall"]:
-                consistency = (consistency + 1.0) / 2.0
-            
-            return float(consistency)
-            
-        except Exception as e:
-            logger.warning(f"Consistency reward computation failed: {e}")
-            return 0.0
-    
-    def compute_reward(self, prompt: str, response: str) -> float:
-        """Compute combined reward: likelihood + consistency"""
-        # Compute likelihood reward
-        likelihood_reward = self.compute_likelihood_reward(prompt, response)
-        
-        # Compute consistency reward
-        consistency_reward = self.compute_consistency_reward(prompt, response)
-        
-        # Combine rewards
-        total_reward = likelihood_reward + self.lambda_consistency * consistency_reward
-        
-        return total_reward
-    
-    def compute_batch_rewards(self, prompts: List[str], responses: List[str]) -> List[float]:
-        """Compute rewards for a batch of prompt-response pairs"""
-        rewards = []
-        for prompt, response in zip(prompts, responses):
-            reward = self.compute_reward(prompt, response)
-            rewards.append(reward)
-        return rewards
+@dataclass
+class TrainConfig:
+    policy_model_name: str = "gpt2"
+    ref_model_name: Optional[str] = None         # if None, no DPO delta; consistency still requires ref to be meaningful
+    max_input_len: int = 2048
+    max_new_tokens: int = 128
+    temperature: float = 0.8
+    top_p: float = 0.9
+    top_k: int = 0
+    do_sample: bool = True
+    num_candidates: int = 3                      # K candidates per prompt (controls consistency computation)
+    lr: float = 1e-5
+    batch_size: int = 1
+    grad_accum: int = 4
+    seed: int = 42
 
-class RAGConsistencyRewardModel:
-    """Enhanced reward model for RAG systems with retrieval consistency"""
-    
-    def __init__(
-        self,
-        base_model,
-        tokenizer,
-        retriever,
-        device,
-        lambda_consistency: float = 0.5,
-        lambda_retrieval: float = 0.1,
-        consistency_method: str = "spearman",
-        num_candidates: int = 3
-    ):
-        self.base_model = base_model
-        self.tokenizer = tokenizer
-        self.retriever = retriever
-        self.device = device
-        self.lambda_consistency = lambda_consistency
-        self.lambda_retrieval = lambda_retrieval
-        self.consistency_method = consistency_method
-        self.num_candidates = num_candidates
-        
-        # Initialize consistency reward model
-        self.consistency_model = ConsistencyRewardModel(
-            base_model=base_model,
-            tokenizer=tokenizer,
-            device=device,
-            lambda_consistency=lambda_consistency,
-            consistency_method=consistency_method,
-            num_candidates=num_candidates
+    # Consistency settings
+    consistency_method: Literal["spearman", "kendall", "toporder"] = "spearman"
+    lambda_consistency: float = 0.5              # λ in reward_total = dpo_part + λ * consistency
+
+    # DPO-style reward combination
+    use_dpo_delta: bool = True                   # if True, reward_part = policy - ref; else reward_part = policy
+
+    # Device/precision helpers
+    device_map: Optional[str] = "auto"           # "auto" or None
+    load_in_8bit: bool = False                   # set True if you rely on 8-bit quantization
+
+# ----------------------------
+# Utilities
+# ----------------------------
+
+def to_device(obj, device):
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device)
+    return obj
+
+def format_prompt(query: str, docs: List[str]) -> str:
+    # Replace this with your own prompt template used in training/inference
+    context = "\n".join([f"[DOC{i+1}] {d}" for i, d in enumerate(docs)])
+    return f"{context}\n\nQ: {query}\nA:"
+
+@torch.no_grad()
+def generate_candidates(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    prompt: str,
+    num_candidates: int,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    do_sample: bool,
+    max_input_len: int,
+) -> List[str]:
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_input_len)
+    input_ids = inputs["input_ids"].to(model.device)
+    attn = inputs.get("attention_mask", None)
+    if attn is not None:
+        attn = attn.to(model.device)
+
+    gen_kwargs = dict(
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        temperature=temperature,
+        top_p=top_p,
+    )
+    if top_k and top_k > 0:
+        gen_kwargs["top_k"] = top_k
+
+    candidates = []
+    for _ in range(num_candidates):
+        out = model.generate(
+            input_ids=input_ids,
+            attention_mask=attn,
+            **gen_kwargs
         )
-    
-    def compute_retrieval_consistency(self, query: str, response: str) -> float:
-        """Compute consistency of retrieval across different query formulations"""
-        try:
-            # Create different query formulations
-            query_variations = [
-                query,
-                f"What is {query.lower()}?",
-                f"Tell me about {query.lower()}",
-                f"Explain {query.lower()}"
-            ]
-            
-            # Retrieve documents for each variation
-            retrieval_results = []
-            for var_query in query_variations:
-                try:
-                    docs = self.retriever.retrieve(var_query, k=3)
-                    retrieval_results.append(docs)
-                except Exception as e:
-                    logger.warning(f"Retrieval failed for query variation: {e}")
-                    retrieval_results.append([])
-            
-            # Compute overlap between retrieval results
-            overlaps = []
-            for i in range(len(retrieval_results)):
-                for j in range(i + 1, len(retrieval_results)):
-                    set1 = set(retrieval_results[i])
-                    set2 = set(retrieval_results[j])
-                    if len(set1) > 0 and len(set2) > 0:
-                        overlap = len(set1.intersection(set2)) / len(set1.union(set2))
-                        overlaps.append(overlap)
-            
-            # Return average overlap as consistency measure
-            if overlaps:
-                return np.mean(overlaps)
-            else:
-                return 0.0
-                
-        except Exception as e:
-            logger.warning(f"Retrieval consistency computation failed: {e}")
-            return 0.0
-    
-    def compute_reward(self, prompt: str, response: str) -> float:
-        """Compute comprehensive reward including retrieval consistency"""
-        # Extract query from prompt (assuming format: "Context: ...\n\nQuestion: ...\nAnswer:")
-        try:
-            if "Question:" in prompt:
-                query = prompt.split("Question:")[1].split("Answer:")[0].strip()
-            else:
-                query = prompt  # Fallback to full prompt
-            
-            # Compute base consistency reward
-            consistency_reward = self.consistency_model.compute_reward(prompt, response)
-            
-            # Compute retrieval consistency
-            retrieval_consistency = self.compute_retrieval_consistency(query, response)
-            
-            # Combine rewards
-            total_reward = consistency_reward + self.lambda_retrieval * retrieval_consistency
-            
-            return total_reward
-            
-        except Exception as e:
-            logger.warning(f"RAG reward computation failed: {e}")
-            return 0.0
-    
-    def compute_batch_rewards(self, prompts: List[str], responses: List[str]) -> List[float]:
-        """Compute rewards for a batch of prompt-response pairs"""
-        rewards = []
-        for prompt, response in zip(prompts, responses):
-            reward = self.compute_reward(prompt, response)
-            rewards.append(reward)
-        return rewards
+        text = tokenizer.decode(out[0], skip_special_tokens=True)
+        # Extract only the assistant response span (after prompt)
+        # A lightweight splitter assuming prompt is suffix:
+        if text.startswith(tokenizer.decode(input_ids[0], skip_special_tokens=True)):
+            resp = text[len(tokenizer.decode(input_ids[0], skip_special_tokens=True)):]
+        else:
+            # Fallback: take tail tokens as "response" (heuristic)
+            resp = text[-(max_new_tokens*4):]
+        candidates.append(resp.strip())
+    return candidates
+
+def _avg_ll_response_span(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    prompt: str,
+    response: str,
+    max_len: int,
+    normalize_by_length: bool = True,
+) -> float:
+    """
+    Average log-likelihood over response tokens only (mirrors your reward file logic):
+    1) Tokenize prompt (prefix) and prompt+response (full)
+    2) Compute per-token logp on full, mask out prefix tokens
+    3) Average over response positions
+    """
+    model.eval()
+    with torch.no_grad():
+        # Tokenize prompt only to get prefix length in tokens
+        prefix = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_len)
+        prefix_ids = prefix["input_ids"][0]
+
+        # Tokenize prompt+response
+        full = tokenizer(
+            prompt + response,
+            return_tensors="pt",
+            truncation=True,
+            max_length=max_len,
+        )
+        input_ids = full["input_ids"].to(model.device)        # [1, L]
+        attn = full.get("attention_mask", None)
+        if attn is not None:
+            attn = attn.to(model.device)
+
+        # Forward
+        logits = model(input_ids=input_ids, attention_mask=attn).logits  # [1, L, V]
+
+        # Shift for next-token prediction
+        logits = logits[:, :-1, :]
+        labels = input_ids[:, 1:]  # [1, L-1]
+
+        # Build loss mask to keep only response tokens
+        prefix_len = prefix_ids.shape[0]
+        # position index 0 in labels corresponds to token 1 in full sequence
+        # response positions start at index (prefix_len - 1) in labels
+        mask = torch.zeros_like(labels, dtype=torch.float32)
+        start = max(prefix_len - 1, 0)
+        mask[:, start:] = 1.0
+
+        # per-token log prob
+        log_probs = F.log_softmax(logits, dim=-1)
+        per_tok = torch.gather(log_probs, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+        masked = per_tok * mask
+
+        total_logp = masked.sum(dim=-1)  # [1]
+        denom = mask.sum(dim=-1).clamp_min(1.0) if normalize_by_length else 1.0
+        avg = (total_logp / denom)[0].item()
+        return avg
+
+def score_candidates_ll(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    prompt: str,
+    candidates: List[str],
+    max_len: int,
+    normalize_by_length: bool = True,
+) -> List[float]:
+    return [
+        _avg_ll_response_span(model, tokenizer, prompt, resp, max_len, normalize_by_length)
+        for resp in candidates
+    ]
+
+def calc_consistency(
+    scores1: List[float],
+    scores2: List[float],
+    method: Literal["spearman", "kendall", "toporder"] = "spearman",
+) -> float:
+    """
+    EXACTLY mirrors your offline script:
+      - ranks via rankdata(method='ordinal')
+      - Spearman or Kendall correlation
+      - scale from [-1,1] to [0,1]
+      - 'toporder' checks matching top & bottom
+    """
+    if len(scores1) != len(scores2):
+        raise ValueError("Score lists must have same length")
+    if len(scores1) == 0:
+        return 0.0
+    if any(s is None for s in scores1) or any(s is None for s in scores2):
+        return 0.0
+
+    r1 = rankdata(scores1, method='ordinal')
+    r2 = rankdata(scores2, method='ordinal')
+
+    if method == "kendall":
+        val, _ = kendalltau(r1, r2)
+        val = 0.0 if (val is None or math.isnan(val)) else (val + 1.0)/2.0
+        return float(val)
+    elif method == "spearman":
+        val, _ = spearmanr(r1, r2)
+        val = 0.0 if (val is None or math.isnan(val)) else (val + 1.0)/2.0
+        return float(val)
+    elif method == "toporder":
+        top1 = int(max(range(len(scores1)), key=lambda i: scores1[i]))
+        bot1 = int(min(range(len(scores1)), key=lambda i: scores1[i]))
+        top2 = int(max(range(len(scores2)), key=lambda i: scores2[i]))
+        bot2 = int(min(range(len(scores2)), key=lambda i: scores2[i]))
+        return 1.0 if (top1 == top2 and bot1 == bot2) else 0.0
+    else:
+        raise ValueError(f"Unsupported consistency method: {method}")
+
+
 
