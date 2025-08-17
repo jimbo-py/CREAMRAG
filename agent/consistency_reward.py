@@ -70,12 +70,19 @@ class ConsistencyRewardModel:
                     log_probs, 1, response_ids.unsqueeze(1)
                 ).squeeze(1)
                 
+                # Handle NaN and inf values
+                token_log_probs = torch.nan_to_num(token_log_probs, nan=0.0, posinf=0.0, neginf=-100.0)
+                
                 # Sum log probabilities
                 total_log_prob = token_log_probs.sum()
                 
                 # Normalize by length if requested
                 if self.normalize_by_length:
                     total_log_prob /= token_log_probs.shape[0]
+                
+                # Final safety check
+                if torch.isnan(total_log_prob) or torch.isinf(total_log_prob):
+                    return 0.0
                 
                 return total_log_prob.item()
                 
@@ -323,6 +330,10 @@ class RAGConsistencyRewardModel:
         """Compute rewards for a batch of prompt-response pairs"""
         rewards = []
         for prompt, response in zip(prompts, responses):
+            reward = self.compute_reward(prompt, response)
+            rewards.append(reward)
+        return rewards
+
             reward = self.compute_reward(prompt, response)
             rewards.append(reward)
         return rewards
