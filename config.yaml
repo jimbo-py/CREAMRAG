@@ -1,25 +1,98 @@
+# RAG Cream PPO Training Configuration
 
-device: cpu  # or "cuda" if you have GPU
+# Device configuration
+device: "cuda:0"  # or "cpu"
 
+# Retriever configuration
 retriever:
-  document_path: data/corpus.jsonl        # JSONL file or JSON list of docs
-  embedding_path: index_embeddings/doc_embeddings.npy  # Torch tensor file
-  max_doc_length: 500
-  top_k: 5                               # Number of docs to retrieve
+  # Dataset options:
+  # - "data/corpus.jsonl" (original: 70K mixed documents)
+  # - "data/enhanced_corpus.jsonl" (original + 10K Wikipedia articles)
+  # - "data/wikipedia_corpus.jsonl" (50K Wikipedia articles only)
+  document_path: "data/corpus.jsonl"  # Path to your document corpus
+  embedding_path: "index_embeddings/doc_embeddings.npy"  # Path to precomputed embeddings
+  top_k: 5  # Number of documents to retrieve
 
+# Generator (LLM) configuration
 generator:
-  model: gpt2                           # HuggingFace model name
-  max_new_tokens: 100
+  model: "meta-llama/Llama-2-7b-chat-hf"  # Your LLaMA model path
+  max_new_tokens: 256
+  temperature: 0.7
+  use_8bit: true  # Enable 8-bit quantization
+  use_4bit: false  # Disable 4-bit for better performance
+  use_flash_attention: false  # Disable flash attention for compatibility
 
+# Reward model configuration
 reward_model:
-  model: distilbert-base-uncased-finetuned-sst-2-english
+  model: "meta-llama/Llama-2-7b-chat-hf"  # Can be same as generator
 
+# Enhanced PPO Training configuration with Consistency Rewards
 training:
+  # Basic parameters
+  epochs: 2  # Reduced for testing
   learning_rate: 1e-5
-  lambda_consistency: 0.1
-  epochs: 5
-  log_interval: 1
-  max_questions_from_corpus: 2000  # Generate more questions
-  direct_document_training: true  # Enable direct document training
-
+  batch_size: 1  # Reduced to 1 for memory efficiency
+  max_grad_norm: 1.0
   
+  # Model parameters
+  max_input_length: 1024
+  max_new_tokens: 128
+  temperature: 0.7
+  
+  # PPO-specific hyperparameters
+  clip_range: 0.1          # PPO clipping parameter (reduced for stability)
+  vf_coef: 0.25            # Value function loss coefficient (reduced)
+  ent_coef: 0.005          # Entropy bonus coefficient (reduced)
+  gamma: 0.99              # Discount factor
+  gae_lambda: 0.95         # GAE lambda parameter
+  ppo_epochs: 2            # Number of PPO update epochs per batch (reduced)
+  minibatch_size: 16       # Minibatch size for PPO updates (reduced for memory)
+  target_kl: 0.05          # Target KL divergence for early stopping (increased)
+  
+  # Value function settings
+  normalize_advantages: true    # Whether to normalize advantages
+  value_clip: true             # Whether to clip value function loss
+  value_lr_multiplier: 1.0     # Learning rate multiplier for value head
+  adaptive_kl: true            # Use adaptive KL control
+  
+  # Consistency reward settings
+  lambda_consistency: 0.5      # Weight for consistency reward
+  lambda_retrieval: 0.1        # Weight for retrieval consistency
+  consistency_method: "spearman"  # Consistency method: "spearman", "kendall", "toporder"
+  num_candidates: 3            # Number of candidates for consistency evaluation
+  
+  # Training stability settings
+  use_gae: true               # Use Generalized Advantage Estimation
+  normalize_rewards: true     # Normalize rewards using running statistics
+  reward_clipping: true       # Clip rewards to prevent extreme values
+  reward_clip_range: 10.0     # Range for reward clipping
+  
+  # Loss weights (legacy - now handled by lambda_consistency and lambda_retrieval)
+  lambda_reward: 1.0
+  
+  # Training strategies
+  use_direct_document_training: true
+  direct_training_ratio: 0.3
+  top_k_variance: true
+  
+  # Optional: separate questions file
+  # questions_path: "data/questions.json"
+  
+  # Data parameters
+  max_questions_from_corpus: 100  # Reduced for testing
+  context_length_limit: 800
+  document_truncation_limit: 500
+  
+  # Optimizer settings
+  optimizer: "adamw"  # or "adam"
+  weight_decay: 0.01
+  scheduler: "cosine"  # or "linear" or null
+  
+  # Logging and saving
+  log_interval: 10
+  eval_interval: 100
+  save_interval: 2
+  save_path: "checkpoints/rag_cream_enhanced_ppo"
+  
+  # PPO specific settings
+  rollout_buffer_size: 2048    # Size of experience buffer
