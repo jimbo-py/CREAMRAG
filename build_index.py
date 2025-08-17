@@ -38,12 +38,18 @@ def main():
 
     print("🔍 Building FAISS index...")
     dim = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dim)
+    # Normalize embeddings for cosine similarity
+    faiss.normalize_L2(embeddings)
+    index = faiss.IndexFlatIP(dim)  # Inner product for cosine similarity
     index.add(embeddings)
 
     print("💾 Saving index and metadata...")
     save_index(index, embeddings, ids)
     print(f"✅ Index built and saved to '{INDEX_DIR}'.")
+
+if __name__ == "__main__":
+    main()
+
 
 if __name__ == "__main__":
     main()
