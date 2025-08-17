@@ -36,7 +36,7 @@ except Exception:
 gc.collect()
 torch.cuda.empty_cache()
 
-login(token="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")  # Add your HuggingFace token here for Llama access
+login(token="")  # Add your HuggingFace token here for Llama access
 
 @dataclass
 class TrainingMetrics:
@@ -284,6 +284,12 @@ def train_epoch(ppo_trainer: EnhancedPPOTrainer, prompts: List[str],
             # Train step
             step_stats = ppo_trainer.train_step(batch_prompts, rollout_size=len(batch_prompts))
             
+            # Check for CUDA corruption
+            if step_stats.get('cuda_error', False):
+                logger.error("CUDA corruption detected - stopping training")
+                logger.error("Please restart the training process")
+                return epoch_metrics
+            
             # Create metrics
             metrics = TrainingMetrics(
                 epoch=epoch,
@@ -316,14 +322,22 @@ def train_epoch(ppo_trainer: EnhancedPPOTrainer, prompts: List[str],
             
             # Memory cleanup after each step
             if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
+                try:
+                    # Use a more gentle cleanup approach
+                    torch.cuda.empty_cache()
+                    # Don't synchronize to avoid CUDA errors
+                except Exception as cleanup_error:
+                    logger.warning(f"Memory cleanup failed: {cleanup_error}")
             
         except Exception as e:
             logger.error(f"Training step failed: {e}")
             # Memory cleanup on error
             if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.empty_cache()
+                    # Don't synchronize to avoid CUDA errors
+                except Exception as cleanup_error:
+                    logger.warning(f"Memory cleanup failed: {cleanup_error}")
             continue
     
     return epoch_metrics
@@ -437,9 +451,12 @@ def main():
         questions_path = config["training"]["questions_path"]
         if os.path.exists(questions_path):
             questions = load_questions(questions_path)
+            # Limit questions for faster training
+            max_questions = config["training"].get("max_questions_from_corpus", 50)
+            questions = questions[:max_questions]
     
     if questions is None:
-        max_questions = config["training"].get("max_questions_from_corpus", 1000)
+        max_questions = config["training"].get("max_questions_from_corpus", 50)
         questions = create_questions_from_documents(documents, max_questions)
     
     logger.info(f"Training with {len(questions)} questions")
@@ -488,26 +505,52 @@ def main():
             
             # Memory cleanup between epochs
             if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
+                try:
+                    torch.cuda.empty_cache()
+                    # Don't synchronize to avoid CUDA errors
+                except Exception as cleanup_error:
+                    logger.warning(f"Memory cleanup failed: {cleanup_error}")
             
         except Exception as e:
             logger.error(f"Epoch {epoch + 1} failed: {e}")
             # Memory cleanup on error
             if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.empty_cache()
+                    # Don't synchronize to avoid CUDA errors
+                except Exception as cleanup_error:
+                    logger.warning(f"Memory cleanup failed: {cleanup_error}")
             continue
     
     logger.info("Training completed successfully!")
     
     # Save final checkpoint
-    save_checkpoint(ppo_trainer, epochs - 1, all_metrics[-len(rag_prompts):], config)
+    try:
+        save_checkpoint(ppo_trainer, epochs - 1, all_metrics[-len(rag_prompts):], config)
+    except Exception as e:
+        logger.error(f"Failed to save final checkpoint: {e}")
     
     # Log final statistics
-    final_stats = ppo_trainer.get_stats_summary()
-    logger.info("Final training statistics:")
-    for key, value in final_stats.items():
-        logger.info(f"  {key}: {value:.6f}")
+    try:
+        final_stats = ppo_trainer.get_stats_summary()
+        logger.info("Final training statistics:")
+        for key, value in final_stats.items():
+            logger.info(f"  {key}: {value:.6f}")
+    except Exception as e:
+        logger.error(f"Failed to log final statistics: {e}")
+    
+    # Final memory cleanup
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            # Don't synchronize to avoid CUDA errors
+        except Exception as cleanup_error:
+            logger.warning(f"Final memory cleanup failed: {cleanup_error}")
+
+if __name__ == "__main__":
+    main()
+
+
 
 if __name__ == "__main__":
     main()
