@@ -9,7 +9,7 @@ retriever:
   # - "data/corpus.jsonl" (original: 70K mixed documents)
   # - "data/enhanced_corpus.jsonl" (original + 10K Wikipedia articles)
   # - "data/wikipedia_corpus.jsonl" (50K Wikipedia articles only)
-  document_path: "data/corpus.jsonl"  # Path to your document corpus
+  document_path: "data/combined/articles.jsonl"  # Path to your document corpus
   embedding_path: "index_embeddings/doc_embeddings.npy"  # Path to precomputed embeddings
   top_k: 5  # Number of documents to retrieve
 
@@ -20,7 +20,7 @@ generator:
   temperature: 0.7
   use_8bit: false  # Disable quantization for stability
   use_4bit: false  # Disable 4-bit for better performance
-  use_flash_attention: false  # Disable flash attention for compatibility
+  use_flash_attention: true  # Enable flash attention for A100 performance
   gradient_checkpointing: true  # Enable gradient checkpointing for memory efficiency
 
 # Reward model configuration
@@ -30,26 +30,26 @@ reward_model:
 
 # Enhanced PPO Training configuration with Consistency Rewards
 training:
-  # Basic parameters
-  epochs: 1  # Reduced to 1 for testing
-  learning_rate: 5e-6  # Reduced learning rate for stability
-  batch_size: 1  # Reduced to 1 for memory efficiency
-  max_grad_norm: 1.0
+  # Basic parameters - Optimized for speed
+  epochs: 3  # Fewer epochs for faster training
+  learning_rate: 5e-6  # Balanced learning rate
+  batch_size: 1  # Smaller batch for faster processing
+  max_grad_norm: 0.5  # Standard value
   
   # Model parameters
-  max_input_length: 128  # Further reduced for stability
-  max_new_tokens: 16  # Further reduced for stability
+  max_input_length: 64  # Smaller for faster generation
+  max_new_tokens: 8  # Smaller for faster generation
   temperature: 0.7
   
   # PPO-specific hyperparameters
-  clip_range: 0.05         # PPO clipping parameter (reduced for stability)
-  vf_coef: 0.1             # Value function loss coefficient (reduced)
-  ent_coef: 0.001          # Entropy bonus coefficient (reduced)
+  clip_range: 0.1         # Standard PPO clip range
+  vf_coef: 0.5            # Standard value function coefficient
+  ent_coef: 0.01          # Standard entropy coefficient
   gamma: 0.99              # Discount factor
   gae_lambda: 0.95         # GAE lambda parameter
-  ppo_epochs: 1            # Number of PPO update epochs per batch (reduced)
-  minibatch_size: 1        # Minibatch size for PPO updates (reduced for memory)
-  target_kl: 0.05          # Target KL divergence for early stopping (increased)
+  ppo_epochs: 1            # Single epoch for stability
+  minibatch_size: 1        # Single sample for stability
+  target_kl: 0.05          # Reasonable target KL
   
   # Value function settings
   normalize_advantages: true    # Whether to normalize advantages
@@ -78,12 +78,12 @@ training:
   top_k_variance: true
   
   # Optional: separate questions file
-  # questions_path: "data/questions.json"
+  questions_path: "data/combined/questions.jsonl"
   
   # Data parameters
-  max_questions_from_corpus: 2  # Further reduced for testing
-  context_length_limit: 100
-  document_truncation_limit: 50
+  max_questions_from_corpus: 50  # Much smaller for faster training
+  context_length_limit: 200
+  document_truncation_limit: 100
   
   # Optimizer settings
   optimizer: "adamw"  # or "adam"
@@ -98,4 +98,6 @@ training:
   
   # PPO specific settings
   rollout_buffer_size: 2048    # Size of experience buffer
+
+
 
