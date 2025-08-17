@@ -8,7 +8,8 @@ from typing import List, Dict, Any, Optional
 import logging
 from huggingface_hub import login
 
-login(token = "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")  # Add your HuggingFace token here
+#login(token = "")  # Add your HuggingFace token here
+# Commented out login to avoid token issues - set HF_TOKEN environment variable instead
 
 logger = logging.getLogger(__name__)
 
@@ -225,4 +226,5 @@ class LlamaGenerator:
             "vocab_size": self.tokenizer.vocab_size,
             "model_parameters": sum(p.numel() for p in self.model.parameters())
         }
+
 
