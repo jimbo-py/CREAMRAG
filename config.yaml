@@ -1,7 +1,7 @@
 # RAG Cream PPO Training Configuration
 
 # Device configuration
-device: "cuda:0"  # or "cpu"
+device: "cuda:0"  # Use GPU for training
 
 # Retriever configuration
 retriever:
@@ -18,35 +18,37 @@ generator:
   model: "meta-llama/Llama-2-7b-chat-hf"  # Your LLaMA model path
   max_new_tokens: 256
   temperature: 0.7
-  use_8bit: true  # Enable 8-bit quantization
+  use_8bit: false  # Disable quantization for stability
   use_4bit: false  # Disable 4-bit for better performance
   use_flash_attention: false  # Disable flash attention for compatibility
+  gradient_checkpointing: true  # Enable gradient checkpointing for memory efficiency
 
 # Reward model configuration
 reward_model:
   model: "meta-llama/Llama-2-7b-chat-hf"  # Can be same as generator
+  gradient_checkpointing: true  # Enable gradient checkpointing for memory efficiency
 
 # Enhanced PPO Training configuration with Consistency Rewards
 training:
   # Basic parameters
-  epochs: 2  # Reduced for testing
-  learning_rate: 1e-5
+  epochs: 1  # Reduced to 1 for testing
+  learning_rate: 5e-6  # Reduced learning rate for stability
   batch_size: 1  # Reduced to 1 for memory efficiency
   max_grad_norm: 1.0
   
   # Model parameters
-  max_input_length: 1024
-  max_new_tokens: 128
+  max_input_length: 128  # Further reduced for stability
+  max_new_tokens: 16  # Further reduced for stability
   temperature: 0.7
   
   # PPO-specific hyperparameters
-  clip_range: 0.1          # PPO clipping parameter (reduced for stability)
-  vf_coef: 0.25            # Value function loss coefficient (reduced)
-  ent_coef: 0.005          # Entropy bonus coefficient (reduced)
+  clip_range: 0.05         # PPO clipping parameter (reduced for stability)
+  vf_coef: 0.1             # Value function loss coefficient (reduced)
+  ent_coef: 0.001          # Entropy bonus coefficient (reduced)
   gamma: 0.99              # Discount factor
   gae_lambda: 0.95         # GAE lambda parameter
-  ppo_epochs: 2            # Number of PPO update epochs per batch (reduced)
-  minibatch_size: 16       # Minibatch size for PPO updates (reduced for memory)
+  ppo_epochs: 1            # Number of PPO update epochs per batch (reduced)
+  minibatch_size: 1        # Minibatch size for PPO updates (reduced for memory)
   target_kl: 0.05          # Target KL divergence for early stopping (increased)
   
   # Value function settings
@@ -79,9 +81,9 @@ training:
   # questions_path: "data/questions.json"
   
   # Data parameters
-  max_questions_from_corpus: 100  # Reduced for testing
-  context_length_limit: 800
-  document_truncation_limit: 500
+  max_questions_from_corpus: 2  # Further reduced for testing
+  context_length_limit: 100
+  document_truncation_limit: 50
   
   # Optimizer settings
   optimizer: "adamw"  # or "adam"
@@ -96,3 +98,4 @@ training:
   
   # PPO specific settings
   rollout_buffer_size: 2048    # Size of experience buffer
+
