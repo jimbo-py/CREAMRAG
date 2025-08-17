@@ -1,606 +1,489 @@
 """
-Enhanced PPO Trainer for CREAM-RAG with Consistency Rewards
-Integrates PPO training with CREAM consistency evaluation
+Enhanced Training Pipeline for CREAM-RAG with PPO and Consistency Rewards
 """
 
+import yaml
+import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
-from typing import List, Dict, Optional, Tuple
+import json
+import random
 import logging
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from ppo_utils import (
-    RolloutBuffer, AdaptiveKLController, PPOLoss, 
-    PPOScheduler, PPOStats, compute_explained_variance,
-    get_gradient_norm, whiten
-)
-from agent.consistency_reward import ConsistencyRewardModel, RAGConsistencyRewardModel
+from huggingface_hub import login
+from typing import List, Dict, Optional
+from dataclasses import dataclass
+from agent.rag_retriever import LlamaRetriever
+from agent.generator import LlamaGenerator
+from enhanced_ppo_trainer import create_enhanced_ppo_trainer, EnhancedPPOTrainer
+import gc
+from tqdm import tqdm
 
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-class EnhancedValueHead(nn.Module):
-    """Enhanced value head with better initialization and architecture"""
-    
-    def __init__(self, hidden_size: int, dropout: float = 0.1):
-        super().__init__()
-        self.dropout = nn.Dropout(dropout)
-        self.linear1 = nn.Linear(hidden_size, hidden_size // 2)
-        self.linear2 = nn.Linear(hidden_size // 2, 1)
-        self.activation = nn.ReLU()
-        
-        # Initialize with orthogonal weights
-        nn.init.orthogonal_(self.linear1.weight, gain=np.sqrt(2))
-        nn.init.orthogonal_(self.linear2.weight, gain=0.01)
-        nn.init.constant_(self.linear1.bias, 0.0)
-        nn.init.constant_(self.linear2.bias, 0.0)
-    
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            hidden_states: [batch_size, seq_len, hidden_size]
-        Returns:
-            values: [batch_size, seq_len]
-        """
-        hidden_states = self.dropout(hidden_states)
-        x = self.activation(self.linear1(hidden_states))
-        x = self.dropout(x)
-        values = self.linear2(x).squeeze(-1)
-        return values
+try:
+    from bitsandbytes.optim import AdamW8bit
+    _USE_BNB = True
+except Exception:
+    from torch.optim import AdamW as TorchAdamW
+    _USE_BNB = False
 
-class EnhancedPPOConfig:
-    """Enhanced configuration for PPO training with consistency rewards"""
-    
-    def __init__(self, **kwargs):
-        # PPO hyperparameters
-        self.clip_range = kwargs.get('clip_range', 0.2)
-        self.vf_coef = kwargs.get('vf_coef', 0.5)
-        self.ent_coef = kwargs.get('ent_coef', 0.01)
-        self.gamma = kwargs.get('gamma', 0.99)
-        self.gae_lambda = kwargs.get('gae_lambda', 0.95)
-        self.ppo_epochs = kwargs.get('ppo_epochs', 4)
-        self.minibatch_size = kwargs.get('minibatch_size', 64)
-        self.max_grad_norm = kwargs.get('max_grad_norm', 1.0)
-        
-        # KL control
-        self.target_kl = kwargs.get('target_kl', 0.01)
-        self.kl_coef = kwargs.get('kl_coef', 0.1)
-        self.adaptive_kl = kwargs.get('adaptive_kl', True)
-        
-        # Value function
-        self.value_clip = kwargs.get('value_clip', True)
-        self.normalize_advantages = kwargs.get('normalize_advantages', True)
-        
-        # Learning rates
-        self.learning_rate = kwargs.get('learning_rate', 1e-5)
-        self.value_lr_multiplier = kwargs.get('value_lr_multiplier', 1.0)
-        
-        # Consistency reward settings
-        self.lambda_consistency = kwargs.get('lambda_consistency', 0.5)
-        self.lambda_retrieval = kwargs.get('lambda_retrieval', 0.1)
-        self.consistency_method = kwargs.get('consistency_method', 'spearman')
-        self.num_candidates = kwargs.get('num_candidates', 3)
-        
-        # Training stability
-        self.use_gae = kwargs.get('use_gae', True)
-        self.normalize_rewards = kwargs.get('normalize_rewards', True)
-        self.reward_clipping = kwargs.get('reward_clipping', True)
-        self.reward_clip_range = kwargs.get('reward_clip_range', 10.0)
+gc.collect()
+torch.cuda.empty_cache()
 
-class EnhancedPPOTrainer:
-    """Enhanced PPO trainer with consistency rewards and better stability"""
+login(token="")  # Add your HuggingFace token here for Llama access
+
+@dataclass
+class TrainingMetrics:
+    """Container for training metrics"""
+    epoch: int
+    step: int
+    policy_loss: float
+    value_loss: float
+    total_loss: float
+    mean_reward: float
+    mean_advantage: float
+    approx_kl: float
+    clipfrac: float
+    explained_variance: float
+    consistency_reward: float
+    retrieval_consistency: float
+
+def load_documents(path: str) -> List[str]:
+    """Load documents from various formats"""
+    documents = []
+    if path.endswith('.jsonl'):
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                obj = json.loads(line)
+                text = obj.get("text") or obj.get("document") or obj.get("content")
+                if text:
+                    documents.append(text)
+    else:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, str):
+                    documents.append(item)
+                elif isinstance(item, dict):
+                    text = item.get("text") or item.get("document") or item.get("content")
+                    if text:
+                        documents.append(text)
+    return documents
+
+def load_questions(path: str) -> List[str]:
+    """Load questions from various formats"""
+    questions = []
+    if path.endswith('.jsonl'):
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                obj = json.loads(line)
+                question = obj.get("question") or obj.get("query") or obj.get("prompt") or obj.get("text")
+                if question:
+                    questions.append(question)
+    else:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, str):
+                    questions.append(item)
+                elif isinstance(item, dict):
+                    question = item.get("question") or item.get("query") or item.get("prompt") or item.get("text")
+                    if question:
+                        questions.append(question)
+    return questions
+
+def create_questions_from_documents(documents: List[str], max_questions: int = 1000) -> List[str]:
+    """Create questions from documents using templates"""
+    questions = []
+    question_templates = [
+        "What information is provided in this document?",
+        "Summarize the key points from this content.",
+        "What are the main details mentioned?",
+        "Explain what this document discusses.",
+        "What specific information can you extract from this?",
+        "Provide an overview of this content.",
+        "What are the important facts mentioned?",
+        "Describe what this document contains.",
+        "What are the key insights from this text?",
+        "What can you learn from this document?",
+    ]
     
-    def __init__(self, model, tokenizer, retriever, config: EnhancedPPOConfig, device):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.retriever = retriever
-        self.config = config
-        self.device = device
+    for i, doc in enumerate(documents):
+        if len(questions) >= max_questions:
+            break
+            
+        # Check if document already contains a question
+        if any(marker in doc.lower() for marker in ["question:", "answer:", "why", "what", "how", "when", "where"]):
+            if "question:" in doc.lower():
+                question_part = doc.split("Question:")[-1].split("Answer:")[0].strip()
+                if question_part and len(question_part) < 200:
+                    questions.append(question_part)
+                    continue
         
-        # Add enhanced value head with matching dtype
-        self.value_head = EnhancedValueHead(model.config.hidden_size).to(device)
-        # Ensure value head matches model dtype
-        if hasattr(self.model, 'dtype'):
-            self.value_head = self.value_head.to(dtype=self.model.dtype)
+        # Use template
+        template = question_templates[i % len(question_templates)]
+        questions.append(template)
         
-        # Setup reward model
-        self.reward_model = RAGConsistencyRewardModel(
-            base_model=model,
-            tokenizer=tokenizer,
-            retriever=retriever,
-            device=device,
-            lambda_consistency=config.lambda_consistency,
-            lambda_retrieval=config.lambda_retrieval,
-            consistency_method=config.consistency_method,
-            num_candidates=config.num_candidates
-        )
-        
-        # Setup optimizers
-        self.setup_optimizers()
-        
-        # Initialize utilities
-        self.kl_controller = AdaptiveKLController(config.target_kl) if config.adaptive_kl else None
-        self.stats = PPOStats()
-        self.loss_fn = PPOLoss()
-        
-        # Training state
-        self.step_count = 0
-        self.reward_stats = {'mean': 0.0, 'std': 1.0}
-        
-    def setup_optimizers(self):
-        """Setup optimizers with better configuration"""
-        # Actor (language model parameters)
-        actor_params = list(self.model.parameters())
-        
-        # Critic (value head parameters)
-        critic_params = list(self.value_head.parameters())
-        
-        # Create optimizers with weight decay
-        self.actor_optimizer = torch.optim.AdamW(
-            actor_params, 
-            lr=self.config.learning_rate,
-            weight_decay=0.01,
-            betas=(0.9, 0.999),
-            eps=1e-8
-        )
-        
-        self.critic_optimizer = torch.optim.AdamW(
-            critic_params,
-            lr=self.config.learning_rate * self.config.value_lr_multiplier,
-            weight_decay=0.01,
-            betas=(0.9, 0.999),
-            eps=1e-8
-        )
+        # Add domain-specific questions
+        doc_lower = doc.lower()
+        if any(word in doc_lower for word in ["restaurant", "pizza", "dining", "food"]):
+            questions.append("Tell me about the restaurants mentioned.")
+        elif any(word in doc_lower for word in ["crime", "statistics", "data"]):
+            questions.append("What statistics or data are provided?")
+        elif any(word in doc_lower for word in ["university", "application", "education"]):
+            questions.append("What information about education is mentioned?")
+        elif any(word in doc_lower for word in ["technology", "software", "computer"]):
+            questions.append("What technology-related information is provided?")
     
-    def normalize_rewards(self, rewards: torch.Tensor) -> torch.Tensor:
-        """Normalize rewards using running statistics"""
-        if self.config.normalize_rewards:
-            # Update running statistics
-            if self.step_count == 0:
-                self.reward_stats['mean'] = rewards.mean().item()
-                self.reward_stats['std'] = rewards.std().item()
-            else:
-                # Exponential moving average
-                alpha = 0.99
-                self.reward_stats['mean'] = alpha * self.reward_stats['mean'] + (1 - alpha) * rewards.mean().item()
-                self.reward_stats['std'] = alpha * self.reward_stats['std'] + (1 - alpha) * rewards.std().item()
-            
-            # Normalize
-            normalized = (rewards - self.reward_stats['mean']) / (self.reward_stats['std'] + 1e-8)
-            
-            # Clip if requested
-            if self.config.reward_clipping:
-                normalized = torch.clamp(normalized, -self.config.reward_clip_range, self.config.reward_clip_range)
-            
-            return normalized
-        else:
-            return rewards
+    return questions[:max_questions]
+
+def create_rag_prompts(questions: List[str], retriever: LlamaRetriever, 
+                      top_k: int = 5, max_context_length: int = 800) -> List[str]:
+    """Create RAG prompts with retrieved context"""
+    rag_prompts = []
     
-    def generate_response_with_log_probs(self, prompt: str, max_new_tokens: int = 32, 
-                                       temperature: float = 0.7) -> Tuple[str, torch.Tensor, torch.Tensor]:
-        """Generate response and return text, log_probs, and values with better handling"""
-        
-        # Tokenize prompt
-        inputs = self.tokenizer(
-            prompt,
-            return_tensors="pt",
-            padding=False,
-            truncation=True,
-            max_length=1024
-        ).to(self.device)
-        
-        # Ensure inputs match model dtype, but keep input_ids as Long
-        if hasattr(self.model, 'dtype'):
-            for key in inputs:
-                if key == 'input_ids':
-                    # Keep input_ids as Long for embedding layer
-                    inputs[key] = inputs[key].to(dtype=torch.long)
-                elif inputs[key].dtype != self.model.dtype:
-                    inputs[key] = inputs[key].to(dtype=self.model.dtype)
-        
-        prompt_length = inputs['input_ids'].shape[1]
-        
-        # Generate with model
-        with torch.no_grad():
-            generation_output = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                do_sample=True,
-                pad_token_id=self.tokenizer.pad_token_id,
-                return_dict_in_generate=True,
-                output_scores=True,
-                eos_token_id=self.tokenizer.eos_token_id,  # Add EOS token
-                early_stopping=True  # Add early stopping
-            )
-            
-            generated_ids = generation_output.sequences[0]
-            response_ids = generated_ids[prompt_length:]
-            
-            # Decode response
-            response = self.tokenizer.decode(response_ids, skip_special_tokens=True)
-        
-        # Get log probabilities and values for the full sequence
-        full_ids = generated_ids.unsqueeze(0)
-        attention_mask = torch.ones_like(full_ids)
-        
-        # Ensure attention_mask matches model dtype
-        if hasattr(self.model, 'dtype'):
-            attention_mask = attention_mask.to(dtype=self.model.dtype)
-        
-        with torch.no_grad():
-            # Forward pass through model
-            model_outputs = self.model(
-                input_ids=full_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True
-            )
-            
-            # Compute log probabilities for response tokens
-            logits = model_outputs.logits[0, prompt_length-1:-1, :]  # [response_len, vocab_size]
-            response_log_probs = F.log_softmax(logits, dim=-1)
-            
-            # Get log probs for actual tokens
-            token_log_probs = torch.gather(
-                response_log_probs, 
-                1, 
-                response_ids.unsqueeze(1)
-            ).squeeze(1)  # [response_len]
-            
-            # Get values from value head
-            hidden_states = model_outputs.hidden_states[-1][0, prompt_length-1:-1, :]  # [response_len, hidden_size]
-            # Ensure hidden_states match value head dtype
-            if hasattr(self.value_head, 'dtype'):
-                hidden_states = hidden_states.to(dtype=self.value_head.dtype)
-            values = self.value_head(hidden_states.unsqueeze(0)).squeeze(0)  # [response_len]
-        
-        return response, token_log_probs.sum(), values.mean()
-    
-    def collect_rollouts(self, prompts: List[str], rollout_size: int) -> RolloutBuffer:
-        """Collect rollouts with enhanced reward computation"""
-        buffer = RolloutBuffer(rollout_size, self.device)
-        
-        self.model.eval()
-        
-        for i, prompt in enumerate(prompts[:rollout_size]):
-            try:
-                # Generate response
-                response, log_prob, value = self.generate_response_with_log_probs(prompt)
-                
-                # Compute enhanced reward with consistency
-                reward = self.reward_model.compute_reward(prompt, response)
-                
-                # Add to buffer
-                buffer.add(
-                    query=prompt,
-                    response=response,
-                    reward=reward,
-                    value=value.item(),
-                    log_prob=log_prob.item(),
-                    mask=True
-                )
-                
-                if (i + 1) % 10 == 0:
-                    logger.info(f"Collected {i + 1}/{rollout_size} rollouts")
-                    
-            except Exception as e:
-                logger.warning(f"Failed to generate rollout {i}: {e}")
+    for question in tqdm(questions, desc="Creating RAG prompts"):
+        try:
+            # Skip empty questions
+            if not question or question.strip() == "":
+                logger.warning("Skipping empty question")
+                rag_prompts.append("Question: What information is provided?\nAnswer:")
                 continue
-        
-        # Compute advantages and returns
-        if self.config.use_gae:
-            buffer.compute_advantages_and_returns(
-                gamma=self.config.gamma,
-                gae_lambda=self.config.gae_lambda
-            )
-        else:
-            # Simple advantage computation
-            batch_data = buffer.get()
-            rewards = batch_data['rewards']
-            values = batch_data['values']
-            advantages = rewards - values
-            returns = rewards
-            buffer.advantages = advantages.tolist()
-            buffer.returns = returns.tolist()
-        
-        return buffer
-    
-    def compute_model_outputs(self, queries: List[str], responses: List[str]) -> Dict[str, torch.Tensor]:
-        """Compute model outputs with better error handling"""
-        batch_size = len(queries)
-        all_log_probs = []
-        all_values = []
-        all_entropies = []
-        
-        for query, response in zip(queries, responses):
-            try:
-                # Combine query and response
-                full_text = query + response
                 
-                # Tokenize
-                inputs = self.tokenizer(
-                    full_text,
-                    return_tensors="pt",
-                    padding=False,
-                    truncation=True,
-                    max_length=1024
-                ).to(self.device)
-                
-                # Get query length for masking
-                query_inputs = self.tokenizer(query, return_tensors="pt", padding=False)
-                query_length = query_inputs['input_ids'].shape[1]
-                
-                # Forward pass
-                outputs = self.model(**inputs, output_hidden_states=True)
-                
-                # Get logits for response tokens only
-                logits = outputs.logits[0, query_length-1:-1, :]  # [response_len, vocab_size]
-                
-                # Get response token IDs
-                response_ids = inputs['input_ids'][0, query_length:]  # [response_len]
-                
-                # Compute log probabilities
-                log_probs = F.log_softmax(logits, dim=-1)
-                token_log_probs = torch.gather(log_probs, 1, response_ids.unsqueeze(1)).squeeze(1)
-                sequence_log_prob = token_log_probs.sum()
-                
-                # Compute entropy
-                probs = F.softmax(logits, dim=-1)
-                entropy = -(probs * log_probs).sum(-1).mean()
-                
-                # Get values
-                hidden_states = outputs.hidden_states[-1][0, query_length-1:-1, :]
-                values = self.value_head(hidden_states.unsqueeze(0)).squeeze(0).mean()
-                
-                all_log_probs.append(sequence_log_prob)
-                all_values.append(values)
-                all_entropies.append(entropy)
-                
-            except Exception as e:
-                logger.warning(f"Model output computation failed: {e}")
-                # Add default values
-                all_log_probs.append(torch.tensor(0.0, device=self.device))
-                all_values.append(torch.tensor(0.0, device=self.device))
-                all_entropies.append(torch.tensor(0.0, device=self.device))
-        
-        return {
-            'log_probs': torch.stack(all_log_probs),
-            'values': torch.stack(all_values),
-            'entropy': torch.stack(all_entropies).mean()
-        }
-    
-    def ppo_update(self, buffer: RolloutBuffer) -> Dict[str, float]:
-        """Enhanced PPO update with better stability"""
-        self.model.train()
-        self.value_head.train()
-        
-        batch_data = buffer.get()
-        batch_size = len(batch_data['queries'])
-        
-        # Normalize rewards
-        batch_data['rewards'] = self.normalize_rewards(batch_data['rewards'])
-        
-        # Store old values for clipping
-        old_values = batch_data['values'].clone()
-        
-        update_stats = {
-            'policy_losses': [],
-            'value_losses': [],
-            'entropy_losses': [],
-            'total_losses': [],
-            'clipfracs': [],
-            'approx_kls': [],
-            'grad_norms': []
-        }
-        
-        # PPO epochs
-        for epoch in range(self.config.ppo_epochs):
-            # Shuffle data
-            indices = torch.randperm(batch_size)
+            # Retrieve relevant documents
+            retrieved_docs = retriever.retrieve(question, k=top_k)
             
-            # Mini-batch updates
-            for start in range(0, batch_size, self.config.minibatch_size):
-                end = start + self.config.minibatch_size
-                mb_indices = indices[start:end]
+            # Check if we got any documents
+            if not retrieved_docs:
+                logger.warning(f"No documents retrieved for question: {question[:50]}...")
+                rag_prompts.append(f"Question: {question}\nAnswer:")
+                continue
+            
+            # Build context
+            context_parts = []
+            total_length = 0
+            
+            for doc in retrieved_docs:
+                # Skip empty documents
+                if not doc or doc.strip() == "":
+                    continue
+                    
+                # Truncate document if too long
+                doc_truncated = doc[:400] if len(doc) > 400 else doc
                 
-                # Get mini-batch data
-                mb_queries = [batch_data['queries'][i] for i in mb_indices]
-                mb_responses = [batch_data['responses'][i] for i in mb_indices]
-                mb_old_log_probs = batch_data['log_probs'][mb_indices]
-                mb_advantages = batch_data['advantages'][mb_indices]
-                mb_returns = batch_data['returns'][mb_indices]
-                mb_old_values = old_values[mb_indices]
-                
-                # Normalize advantages
-                if self.config.normalize_advantages:
-                    mb_advantages = whiten(mb_advantages)
-                
-                # Compute current model outputs
-                model_outputs = self.compute_model_outputs(mb_queries, mb_responses)
-                current_log_probs = model_outputs['log_probs']
-                current_values = model_outputs['values']
-                entropy = model_outputs['entropy']
-                
-                # Ensure all tensors have the same dtype as the model
-                model_dtype = next(self.model.parameters()).dtype
-                current_log_probs = current_log_probs.to(dtype=model_dtype)
-                mb_old_log_probs = mb_old_log_probs.to(dtype=model_dtype)
-                mb_advantages = mb_advantages.to(dtype=model_dtype)
-                current_values = current_values.to(dtype=model_dtype)
-                mb_returns = mb_returns.to(dtype=model_dtype)
-                mb_old_values = mb_old_values.to(dtype=model_dtype)
-                entropy = entropy.to(dtype=model_dtype)
-                
-                # Compute losses
-                policy_loss, policy_metrics = self.loss_fn.compute_policy_loss(
-                    current_log_probs, mb_old_log_probs, mb_advantages, self.config.clip_range
-                )
-                
-                value_loss, value_metrics = self.loss_fn.compute_value_loss(
-                    current_values, mb_returns, mb_old_values, 
-                    self.config.clip_range, self.config.value_clip
-                )
-                
-                entropy_loss = -self.config.ent_coef * entropy
-                
-                # Total loss
-                total_loss = policy_loss + self.config.vf_coef * value_loss + entropy_loss
-                
-                # Backward pass
-                self.actor_optimizer.zero_grad()
-                self.critic_optimizer.zero_grad()
-                
-                total_loss.backward()
-                
-                # Gradient clipping
-                actor_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.config.max_grad_norm
-                )
-                critic_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.value_head.parameters(), self.config.max_grad_norm
-                )
-                
-                self.actor_optimizer.step()
-                self.critic_optimizer.step()
-                
-                # Collect statistics
-                update_stats['policy_losses'].append(policy_loss.item())
-                update_stats['value_losses'].append(value_loss.item())
-                update_stats['entropy_losses'].append(entropy_loss.item())
-                update_stats['total_losses'].append(total_loss.item())
-                update_stats['clipfracs'].append(policy_metrics['clipfrac'])
-                update_stats['approx_kls'].append(policy_metrics['approx_kl'])
-                update_stats['grad_norms'].append(actor_grad_norm.item())
-                
-                # Early stopping if KL divergence is too high
-                if policy_metrics['approx_kl'] > 1.5 * self.config.target_kl:
-                    logger.warning(f"Early stopping due to high KL: {policy_metrics['approx_kl']:.6f}")
+                if total_length + len(doc_truncated) > max_context_length:
                     break
+                    
+                context_parts.append(doc_truncated)
+                total_length += len(doc_truncated)
             
-            # Check KL divergence for early stopping between epochs
-            mean_kl = np.mean(update_stats['approx_kls'][-10:]) if update_stats['approx_kls'] else 0
-            if mean_kl > 1.5 * self.config.target_kl:
-                logger.warning(f"Early stopping at epoch {epoch+1} due to high KL: {mean_kl:.6f}")
-                break
-        
-        # Update KL controller
-        if self.kl_controller:
-            mean_kl = np.mean(update_stats['approx_kls']) if update_stats['approx_kls'] else 0
-            self.config.kl_coef = self.kl_controller.update(mean_kl)
-        
-        # Compute explained variance
-        explained_var = compute_explained_variance(batch_data['values'], batch_data['returns'])
-        
-        # Return statistics
-        stats = {
-            'policy_loss': np.mean(update_stats['policy_losses']),
-            'value_loss': np.mean(update_stats['value_losses']),
-            'entropy_loss': np.mean(update_stats['entropy_losses']),
-            'total_loss': np.mean(update_stats['total_losses']),
-            'clipfrac': np.mean(update_stats['clipfracs']),
-            'approx_kl': np.mean(update_stats['approx_kls']),
-            'grad_norm': np.mean(update_stats['grad_norms']),
-            'explained_variance': explained_var,
-            'kl_coef': self.config.kl_coef,
-            'mean_reward': batch_data['rewards'].mean().item(),
-            'mean_advantage': batch_data['advantages'].mean().item(),
-            'mean_return': batch_data['returns'].mean().item(),
-            'reward_std': batch_data['rewards'].std().item()
-        }
-        
-        return stats
+            # Create context string
+            if context_parts:
+                context = "\n---\n".join(context_parts)
+                full_prompt = f"Context:\n{context}\n\nQuestion: {question}\nAnswer:"
+            else:
+                # No context available
+                full_prompt = f"Question: {question}\nAnswer:"
+                
+            rag_prompts.append(full_prompt)
+            
+        except Exception as e:
+            logger.warning(f"Failed to create RAG prompt for question '{question[:50]}...': {e}")
+            # Fallback to simple prompt
+            rag_prompts.append(f"Question: {question}\nAnswer:")
     
-    def train_step(self, prompts: List[str], rollout_size: int = None) -> Dict[str, float]:
-        """Complete enhanced PPO training step"""
-        if rollout_size is None:
-            rollout_size = len(prompts)
-        
-        # Collect rollouts
-        logger.info(f"Collecting {rollout_size} rollouts...")
-        buffer = self.collect_rollouts(prompts, rollout_size)
-        
-        # PPO update
-        logger.info("Performing PPO update...")
-        stats = self.ppo_update(buffer)
-        
-        # Update step count
-        self.step_count += 1
-        
-        # Log statistics
-        self.stats.update(**stats)
-        
-        return stats
-    
-    def save_checkpoint(self, path: str, epoch: int, additional_info: Dict = None):
-        """Save training checkpoint with enhanced information"""
-        checkpoint = {
-            'epoch': epoch,
-            'step_count': self.step_count,
-            'model_state_dict': self.model.state_dict(),
-            'value_head_state_dict': self.value_head.state_dict(),
-            'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
-            'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
-            'config': self.config.__dict__,
-            'kl_coef': self.config.kl_coef,
-            'reward_stats': self.reward_stats
-        }
-        
-        if additional_info:
-            checkpoint.update(additional_info)
-        
-        torch.save(checkpoint, path)
-        logger.info(f"Checkpoint saved to {path}")
-    
-    def load_checkpoint(self, path: str) -> Dict:
-        """Load training checkpoint"""
-        checkpoint = torch.load(path, map_location=self.device)
-        
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.value_head.load_state_dict(checkpoint['value_head_state_dict'])
-        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
-        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
-        
-        self.step_count = checkpoint.get('step_count', 0)
-        self.config.kl_coef = checkpoint.get('kl_coef', self.config.kl_coef)
-        self.reward_stats = checkpoint.get('reward_stats', self.reward_stats)
-        
-        logger.info(f"Checkpoint loaded from {path}")
-        return checkpoint
-    
-    def get_stats_summary(self) -> Dict[str, float]:
-        """Get training statistics summary"""
-        return self.stats.get_means()
-    
-    def reset_stats(self):
-        """Reset training statistics"""
-        self.stats.reset()
+    return rag_prompts
 
-def create_enhanced_ppo_trainer(model, tokenizer, retriever, config_dict: Dict, device) -> EnhancedPPOTrainer:
-    """Factory function to create enhanced PPO trainer"""
+def setup_models_and_retriever(config: Dict, device: torch.device):
+    """Setup all models and retriever"""
+    logger.info("Setting up models and retriever...")
     
-    # Extract enhanced PPO config
-    ppo_config = EnhancedPPOConfig(
-        clip_range=config_dict.get('clip_range', 0.2),
-        vf_coef=config_dict.get('vf_coef', 0.5),
-        ent_coef=config_dict.get('ent_coef', 0.01),
-        gamma=config_dict.get('gamma', 0.99),
-        gae_lambda=config_dict.get('gae_lambda', 0.95),
-        ppo_epochs=config_dict.get('ppo_epochs', 4),
-        minibatch_size=config_dict.get('minibatch_size', 64),
-        max_grad_norm=config_dict.get('max_grad_norm', 1.0),
-        target_kl=config_dict.get('target_kl', 0.01),
-        learning_rate=float(config_dict.get('learning_rate', 1e-5)),
-        normalize_advantages=config_dict.get('normalize_advantages', True),
-        value_clip=config_dict.get('value_clip', True),
-        adaptive_kl=config_dict.get('adaptive_kl', True),
-        lambda_consistency=config_dict.get('lambda_consistency', 0.5),
-        lambda_retrieval=config_dict.get('lambda_retrieval', 0.1),
-        consistency_method=config_dict.get('consistency_method', 'spearman'),
-        num_candidates=config_dict.get('num_candidates', 3),
-        use_gae=config_dict.get('use_gae', True),
-        normalize_rewards=config_dict.get('normalize_rewards', True),
-        reward_clipping=config_dict.get('reward_clipping', True),
-        reward_clip_range=config_dict.get('reward_clip_range', 10.0)
+    # Setup retriever
+    retriever = LlamaRetriever(
+        model_name="ignored-for-st",
+        device=str(device),
+        max_length=config["retriever"].get("max_length", 512),
+        use_4bit=False,
+        use_8bit=False,
+        use_flash_attention=False,
+        backend="st",
+        st_model_name="intfloat/e5-base-v2",
     )
     
-    return EnhancedPPOTrainer(model, tokenizer, retriever, ppo_config, device)
+    # Load index
+    retriever.load_index_from_components(
+        index_dir="index_embeddings",
+        corpus_path=config["retriever"]["document_path"],
+    )
+    
+    # Setup generator model
+    generator = LlamaGenerator(
+        model_name=config["generator"]["model"],
+        device=str(device),
+        max_length=config["training"]["max_input_length"],
+        temperature=config["generator"]["temperature"],
+        use_4bit=config["generator"].get("use_4bit", False),
+        use_8bit=config["generator"].get("use_8bit", False),
+        use_flash_attention=config["generator"].get("use_flash_attention", False)
+    )
+    
+    logger.info("Models and retriever setup completed")
+    return retriever, generator
+
+def create_enhanced_ppo_trainer_wrapper(generator, retriever, config: Dict, device: torch.device) -> EnhancedPPOTrainer:
+    """Create enhanced PPO trainer with proper configuration"""
+    logger.info("Creating enhanced PPO trainer...")
+    
+    # Extract training configuration
+    training_config = config["training"]
+    
+    # Create PPO trainer
+    ppo_trainer = create_enhanced_ppo_trainer(
+        model=generator.model,
+        tokenizer=generator.tokenizer,
+        retriever=retriever,
+        config_dict=training_config,
+        device=device
+    )
+    
+    logger.info("Enhanced PPO trainer created successfully")
+    return ppo_trainer
+
+def train_epoch(ppo_trainer: EnhancedPPOTrainer, prompts: List[str], 
+                config: Dict, epoch: int) -> List[TrainingMetrics]:
+    """Train for one epoch"""
+    logger.info(f"Starting epoch {epoch + 1}")
+    
+    batch_size = config["training"].get("batch_size", 4)
+    log_interval = config["training"].get("log_interval", 10)
+    save_interval = config["training"].get("save_interval", 5)
+    
+    # Shuffle prompts
+    shuffled_prompts = prompts.copy()
+    random.shuffle(shuffled_prompts)
+    
+    epoch_metrics = []
+    step = 0
+    
+    # Process in batches
+    for batch_start in tqdm(range(0, len(shuffled_prompts), batch_size), 
+                           desc=f"Epoch {epoch + 1}"):
+        batch_prompts = shuffled_prompts[batch_start:batch_start + batch_size]
+        
+        try:
+            # Train step
+            step_stats = ppo_trainer.train_step(batch_prompts, rollout_size=len(batch_prompts))
+            
+            # Create metrics
+            metrics = TrainingMetrics(
+                epoch=epoch,
+                step=step,
+                policy_loss=step_stats.get('policy_loss', 0.0),
+                value_loss=step_stats.get('value_loss', 0.0),
+                total_loss=step_stats.get('total_loss', 0.0),
+                mean_reward=step_stats.get('mean_reward', 0.0),
+                mean_advantage=step_stats.get('mean_advantage', 0.0),
+                approx_kl=step_stats.get('approx_kl', 0.0),
+                clipfrac=step_stats.get('clipfrac', 0.0),
+                explained_variance=step_stats.get('explained_variance', 0.0),
+                consistency_reward=step_stats.get('consistency_reward', 0.0),
+                retrieval_consistency=step_stats.get('retrieval_consistency', 0.0)
+            )
+            
+            epoch_metrics.append(metrics)
+            
+            # Log progress
+            if step % log_interval == 0:
+                logger.info(
+                    f"Epoch {epoch + 1}, Step {step}: "
+                    f"Policy Loss: {metrics.policy_loss:.4f}, "
+                    f"Value Loss: {metrics.value_loss:.4f}, "
+                    f"Mean Reward: {metrics.mean_reward:.4f}, "
+                    f"KL: {metrics.approx_kl:.6f}"
+                )
+            
+            step += 1
+            
+        except Exception as e:
+            logger.error(f"Training step failed: {e}")
+            continue
+    
+    return epoch_metrics
+
+def save_checkpoint(ppo_trainer: EnhancedPPOTrainer, epoch: int, 
+                   metrics: List[TrainingMetrics], config: Dict):
+    """Save training checkpoint"""
+    if "save_path" not in config["training"]:
+        return
+    
+    save_path = config["training"]["save_path"]
+    checkpoint_path = f"{save_path}_enhanced_epoch_{epoch + 1}.pt"
+    
+    # Calculate average metrics
+    avg_metrics = {
+        'policy_loss': np.mean([m.policy_loss for m in metrics]),
+        'value_loss': np.mean([m.value_loss for m in metrics]),
+        'total_loss': np.mean([m.total_loss for m in metrics]),
+        'mean_reward': np.mean([m.mean_reward for m in metrics]),
+        'mean_advantage': np.mean([m.mean_advantage for m in metrics]),
+        'approx_kl': np.mean([m.approx_kl for m in metrics]),
+        'clipfrac': np.mean([m.clipfrac for m in metrics]),
+        'explained_variance': np.mean([m.explained_variance for m in metrics])
+    }
+    
+    ppo_trainer.save_checkpoint(
+        path=checkpoint_path,
+        epoch=epoch,
+        additional_info={
+            'avg_metrics': avg_metrics,
+            'config': config
+        }
+    )
+    
+    logger.info(f"Checkpoint saved to {checkpoint_path}")
+
+def log_epoch_summary(epoch: int, metrics: List[TrainingMetrics]):
+    """Log epoch summary"""
+    if not metrics:
+        return
+    
+    avg_metrics = {
+        'policy_loss': np.mean([m.policy_loss for m in metrics]),
+        'value_loss': np.mean([m.value_loss for m in metrics]),
+        'total_loss': np.mean([m.total_loss for m in metrics]),
+        'mean_reward': np.mean([m.mean_reward for m in metrics]),
+        'mean_advantage': np.mean([m.mean_advantage for m in metrics]),
+        'approx_kl': np.mean([m.approx_kl for m in metrics]),
+        'clipfrac': np.mean([m.clipfrac for m in metrics]),
+        'explained_variance': np.mean([m.explained_variance for m in metrics])
+    }
+    
+    logger.info(f"\n=== EPOCH {epoch + 1} SUMMARY ===")
+    logger.info(f"Average Policy Loss: {avg_metrics['policy_loss']:.4f}")
+    logger.info(f"Average Value Loss: {avg_metrics['value_loss']:.4f}")
+    logger.info(f"Average Total Loss: {avg_metrics['total_loss']:.4f}")
+    logger.info(f"Average Mean Reward: {avg_metrics['mean_reward']:.4f}")
+    logger.info(f"Average Mean Advantage: {avg_metrics['mean_advantage']:.4f}")
+    logger.info(f"Average KL Divergence: {avg_metrics['approx_kl']:.6f}")
+    logger.info(f"Average Clip Fraction: {avg_metrics['clipfrac']:.4f}")
+    logger.info(f"Average Explained Variance: {avg_metrics['explained_variance']:.4f}")
+    logger.info("=" * 50)
+
+def main():
+    """Main training function"""
+    logger.info("Starting enhanced CREAM-RAG PPO training")
+    
+    # Load configuration
+    config_path = "config.yaml"
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(f"Config file not found at {config_path}")
+    
+    with open(config_path, "r", encoding='utf-8') as f:
+        config = yaml.safe_load(f)
+    
+    logger.info("Configuration loaded successfully")
+    
+    # Setup device
+    requested_device = config["device"]
+    if requested_device == "cuda" or requested_device.startswith("cuda:"):
+        if torch.cuda.is_available():
+            device = torch.device(requested_device)
+            logger.info(f"Using device: {device}")
+        else:
+            logger.warning(f"CUDA requested ({requested_device}) but not available. Falling back to CPU.")
+            device = torch.device("cpu")
+    else:
+        device = torch.device(requested_device)
+        logger.info(f"Using device: {device}")
+    
+    # Load documents
+    doc_path = config["retriever"]["document_path"]
+    if not os.path.exists(doc_path):
+        alternatives = ["corpus.jsonl", "data/corpus.jsonl", "documents.jsonl", "data/documents.jsonl"]
+        found_file = None
+        for alt_path in alternatives:
+            if os.path.exists(alt_path):
+                found_file = alt_path
+                break
+        if found_file:
+            doc_path = found_file
+        else:
+            raise FileNotFoundError(f"Could not find document file at {doc_path}")
+    
+    documents = load_documents(doc_path)
+    logger.info(f"Loaded {len(documents)} documents")
+    
+    # Load or create questions
+    questions = None
+    if "training" in config and "questions_path" in config["training"]:
+        questions_path = config["training"]["questions_path"]
+        if os.path.exists(questions_path):
+            questions = load_questions(questions_path)
+    
+    if questions is None:
+        max_questions = config["training"].get("max_questions_from_corpus", 1000)
+        questions = create_questions_from_documents(documents, max_questions)
+    
+    logger.info(f"Training with {len(questions)} questions")
+    
+    # Setup models and retriever
+    retriever, generator = setup_models_and_retriever(config, device)
+    
+    # Create RAG prompts
+    rag_prompts = create_rag_prompts(
+        questions=questions,
+        retriever=retriever,
+        top_k=config["retriever"]["top_k"],
+        max_context_length=config["training"].get("context_length_limit", 800)
+    )
+    
+    logger.info(f"Created {len(rag_prompts)} RAG prompts")
+    
+    # Create enhanced PPO trainer
+    ppo_trainer = create_enhanced_ppo_trainer_wrapper(generator, retriever, config, device)
+    
+    # Training loop
+    epochs = config["training"]["epochs"]
+    all_metrics = []
+    
+    for epoch in range(epochs):
+        try:
+            # Train epoch
+            epoch_metrics = train_epoch(ppo_trainer, rag_prompts, config, epoch)
+            all_metrics.extend(epoch_metrics)
+            
+            # Log summary
+            log_epoch_summary(epoch, epoch_metrics)
+            
+            # Save checkpoint
+            if (epoch + 1) % config["training"].get("save_interval", 5) == 0:
+                save_checkpoint(ppo_trainer, epoch, epoch_metrics, config)
+            
+            # Reset stats for next epoch
+            ppo_trainer.reset_stats()
+            
+        except Exception as e:
+            logger.error(f"Epoch {epoch + 1} failed: {e}")
+            continue
+    
+    logger.info("Training completed successfully!")
+    
+    # Save final checkpoint
+    save_checkpoint(ppo_trainer, epochs - 1, all_metrics[-len(rag_prompts):], config)
+    
+    # Log final statistics
+    final_stats = ppo_trainer.get_stats_summary()
+    logger.info("Final training statistics:")
+    for key, value in final_stats.items():
+        logger.info(f"  {key}: {value:.6f}")
+
+if __name__ == "__main__":
+    main()
