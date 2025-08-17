@@ -15,7 +15,7 @@ from typing import List, Dict, Optional
 from dataclasses import dataclass
 from agent.rag_retriever import LlamaRetriever
 from agent.generator import LlamaGenerator
-from enhanced_ppo_trainer import create_enhanced_ppo_trainer, EnhancedPPOTrainer
+from ppo_trainer import create_enhanced_ppo_trainer, EnhancedPPOTrainer
 import gc
 from tqdm import tqdm
 
@@ -36,7 +36,7 @@ except Exception:
 gc.collect()
 torch.cuda.empty_cache()
 
-login(token="")  # Add your HuggingFace token here for Llama access
+login(token="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")  # Add your HuggingFace token here for Llama access
 
 @dataclass
 class TrainingMetrics:
@@ -196,7 +196,9 @@ def create_rag_prompts(questions: List[str], retriever: LlamaRetriever,
             rag_prompts.append(full_prompt)
             
         except Exception as e:
+            import traceback
             logger.warning(f"Failed to create RAG prompt for question '{question[:50]}...': {e}")
+            logger.warning(f"Traceback: {traceback.format_exc()}")
             # Fallback to simple prompt
             rag_prompts.append(f"Question: {question}\nAnswer:")
     
@@ -215,7 +217,7 @@ def setup_models_and_retriever(config: Dict, device: torch.device):
         use_8bit=False,
         use_flash_attention=False,
         backend="st",
-        st_model_name="intfloat/e5-base-v2",
+        st_model_name="all-MiniLM-L6-v2",  # Match the model used in build_index.py
     )
     
     # Load index
@@ -312,8 +314,16 @@ def train_epoch(ppo_trainer: EnhancedPPOTrainer, prompts: List[str],
             
             step += 1
             
+            # Memory cleanup after each step
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            
         except Exception as e:
             logger.error(f"Training step failed: {e}")
+            # Memory cleanup on error
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             continue
     
     return epoch_metrics
@@ -437,6 +447,12 @@ def main():
     # Setup models and retriever
     retriever, generator = setup_models_and_retriever(config, device)
     
+    # Enable memory-efficient settings
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    
     # Create RAG prompts
     rag_prompts = create_rag_prompts(
         questions=questions,
@@ -470,8 +486,16 @@ def main():
             # Reset stats for next epoch
             ppo_trainer.reset_stats()
             
+            # Memory cleanup between epochs
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            
         except Exception as e:
             logger.error(f"Epoch {epoch + 1} failed: {e}")
+            # Memory cleanup on error
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             continue
     
     logger.info("Training completed successfully!")
@@ -487,3 +511,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
