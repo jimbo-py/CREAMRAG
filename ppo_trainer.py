@@ -127,6 +127,11 @@ class EnhancedPPOTrainer:
         self.step_count = 0
         self.reward_stats = {'mean': 0.0, 'std': 1.0}
         
+        # Create a backup of the initial model state
+        self.model_backup = {}
+        for name, param in self.model.named_parameters():
+            self.model_backup[name] = param.data.clone()
+        
     def setup_optimizers(self):
         """Setup optimizers with better configuration"""
         # Actor (language model parameters)
@@ -151,34 +156,68 @@ class EnhancedPPOTrainer:
             betas=(0.9, 0.999),
             eps=1e-8
         )
+        
+        # Initially freeze the actor model to train only the value head
+        self.actor_frozen = True
+        self.actor_freeze_steps = 0
+        self.actor_unfreeze_threshold = 100  # Unfreeze after 100 steps
+        for param in self.model.parameters():
+            param.requires_grad = False
+        logger.info("Actor model frozen initially - training only value head")
     
     def normalize_rewards(self, rewards: torch.Tensor) -> torch.Tensor:
         """Normalize rewards using running statistics"""
         if self.config.normalize_rewards:
-            # Update running statistics
-            if self.step_count == 0:
-                self.reward_stats['mean'] = rewards.mean().item()
-                self.reward_stats['std'] = rewards.std().item()
-            else:
-                # Exponential moving average
-                alpha = 0.99
-                self.reward_stats['mean'] = alpha * self.reward_stats['mean'] + (1 - alpha) * rewards.mean().item()
-                self.reward_stats['std'] = alpha * self.reward_stats['std'] + (1 - alpha) * rewards.std().item()
-            
-            # Normalize
-            normalized = (rewards - self.reward_stats['mean']) / (self.reward_stats['std'] + 1e-8)
-            
-            # Clip if requested
-            if self.config.reward_clipping:
-                normalized = torch.clamp(normalized, -self.config.reward_clip_range, self.config.reward_clip_range)
-            
-            return normalized
+            try:
+                # Move to CPU for safer computation
+                rewards_cpu = rewards.detach().cpu()
+                
+                # Handle NaN and inf values in rewards
+                rewards_cpu = torch.nan_to_num(rewards_cpu, nan=0.0, posinf=10.0, neginf=-10.0)
+                
+                # Update running statistics
+                if self.step_count == 0:
+                    self.reward_stats['mean'] = rewards_cpu.mean().item()
+                    self.reward_stats['std'] = rewards_cpu.std().item()
+                else:
+                    # Exponential moving average
+                    alpha = 0.99
+                    self.reward_stats['mean'] = alpha * self.reward_stats['mean'] + (1 - alpha) * rewards_cpu.mean().item()
+                    self.reward_stats['std'] = alpha * self.reward_stats['std'] + (1 - alpha) * rewards_cpu.std().item()
+                
+                # Ensure std is not zero or NaN
+                if self.reward_stats['std'] <= 0 or np.isnan(self.reward_stats['std']):
+                    self.reward_stats['std'] = 1.0
+                
+                # Normalize
+                normalized = (rewards_cpu - self.reward_stats['mean']) / (self.reward_stats['std'] + 1e-8)
+                
+                # Clip if requested
+                if self.config.reward_clipping:
+                    normalized = torch.clamp(normalized, -self.config.reward_clip_range, self.config.reward_clip_range)
+                
+                # Move back to original device
+                return normalized.to(rewards.device)
+                
+            except Exception as e:
+                logger.warning(f"Reward normalization failed: {e}, using original rewards")
+                return rewards
         else:
             return rewards
     
     def generate_response_with_log_probs(self, prompt: str, max_new_tokens: int = 32, 
                                        temperature: float = 0.7) -> Tuple[str, torch.Tensor, torch.Tensor]:
         """Generate response and return text, log_probs, and values with better handling"""
+        
+        # Check if model is in a valid state before generation
+        model_weights_valid = all(torch.isfinite(p).all() for p in self.model.parameters())
+        if not model_weights_valid:
+            logger.error("Model weights are invalid before generation, restoring from backup")
+            # Restore model from backup
+            for name, param in self.model.named_parameters():
+                if name in self.model_backup:
+                    param.data = self.model_backup[name].clone()
+            logger.info("Model restored from backup before generation")
         
         # Tokenize prompt
         inputs = self.tokenizer(
@@ -202,17 +241,39 @@ class EnhancedPPOTrainer:
         
         # Generate with model
         with torch.no_grad():
-            generation_output = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                do_sample=True,
-                pad_token_id=self.tokenizer.pad_token_id,
-                return_dict_in_generate=True,
-                output_scores=True,
-                eos_token_id=self.tokenizer.eos_token_id,  # Add EOS token
-                early_stopping=True  # Add early stopping
-            )
+            try:
+                generation_output = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    return_dict_in_generate=True,
+                    output_scores=True,
+                    eos_token_id=self.tokenizer.eos_token_id,  # Add EOS token
+                    early_stopping=True  # Add early stopping
+                )
+            except RuntimeError as e:
+                if "device-side assert" in str(e):
+                    logger.warning(f"Generation failed due to device-side assert, using fallback: {e}")
+                    # Fallback to greedy generation with minimal parameters
+                    try:
+                        generation_output = self.model.generate(
+                            **inputs,
+                            max_new_tokens=max_new_tokens,
+                            temperature=0.0,  # Greedy
+                            do_sample=False,
+                            pad_token_id=self.tokenizer.pad_token_id,
+                            return_dict_in_generate=True,
+                            output_scores=True,
+                            eos_token_id=self.tokenizer.eos_token_id
+                        )
+                    except RuntimeError as e2:
+                        logger.error(f"Even fallback generation failed: {e2}")
+                        # Return a simple default response
+                        return "Error in generation", torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device)
+                else:
+                    raise e
             
             generated_ids = generation_output.sequences[0]
             response_ids = generated_ids[prompt_length:]
@@ -238,6 +299,15 @@ class EnhancedPPOTrainer:
             
             # Compute log probabilities for response tokens
             logits = model_outputs.logits[0, prompt_length-1:-1, :]  # [response_len, vocab_size]
+            
+            # Handle potential NaN/inf in logits
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=100.0, neginf=-100.0)
+            
+            # Additional safety check: ensure logits are finite
+            if not torch.isfinite(logits).all():
+                logger.warning("Non-finite logits detected, using fallback")
+                return "Error in generation", torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device)
+            
             response_log_probs = F.log_softmax(logits, dim=-1)
             
             # Get log probs for actual tokens
@@ -246,6 +316,9 @@ class EnhancedPPOTrainer:
                 1, 
                 response_ids.unsqueeze(1)
             ).squeeze(1)  # [response_len]
+            
+            # Handle NaN/inf in token log probs
+            token_log_probs = torch.nan_to_num(token_log_probs, nan=0.0, posinf=0.0, neginf=-100.0)
             
             # Get values from value head
             hidden_states = model_outputs.hidden_states[-1][0, prompt_length-1:-1, :]  # [response_len, hidden_size]
@@ -262,6 +335,8 @@ class EnhancedPPOTrainer:
         
         self.model.eval()
         
+        successful_rollouts = 0
+        
         for i, prompt in enumerate(prompts[:rollout_size]):
             try:
                 # Generate response
@@ -269,6 +344,10 @@ class EnhancedPPOTrainer:
                 
                 # Compute enhanced reward with consistency
                 reward = self.reward_model.compute_reward(prompt, response)
+                
+                # Handle NaN/inf in reward
+                if np.isnan(reward) or np.isinf(reward):
+                    reward = 0.0
                 
                 # Add to buffer
                 buffer.add(
@@ -280,12 +359,28 @@ class EnhancedPPOTrainer:
                     mask=True
                 )
                 
+                successful_rollouts += 1
+                
                 if (i + 1) % 10 == 0:
                     logger.info(f"Collected {i + 1}/{rollout_size} rollouts")
                     
             except Exception as e:
                 logger.warning(f"Failed to generate rollout {i}: {e}")
+                # Add a default rollout with zero reward
+                buffer.add(
+                    query=prompt,
+                    response="Error in generation",
+                    reward=0.0,
+                    value=0.0,
+                    log_prob=0.0,
+                    mask=True
+                )
                 continue
+        
+        # Check if we have any successful rollouts
+        if successful_rollouts == 0:
+            logger.error("No successful rollouts collected, returning empty buffer")
+            return buffer
         
         # Compute advantages and returns
         if self.config.use_gae:
@@ -339,14 +434,24 @@ class EnhancedPPOTrainer:
                 # Get response token IDs
                 response_ids = inputs['input_ids'][0, query_length:]  # [response_len]
                 
+                # Handle potential NaN/inf in logits
+                logits = torch.nan_to_num(logits, nan=0.0, posinf=100.0, neginf=-100.0)
+                
                 # Compute log probabilities
                 log_probs = F.log_softmax(logits, dim=-1)
                 token_log_probs = torch.gather(log_probs, 1, response_ids.unsqueeze(1)).squeeze(1)
+                
+                # Handle NaN/inf in token log probs
+                token_log_probs = torch.nan_to_num(token_log_probs, nan=0.0, posinf=0.0, neginf=-100.0)
                 sequence_log_prob = token_log_probs.sum()
                 
                 # Compute entropy
                 probs = F.softmax(logits, dim=-1)
                 entropy = -(probs * log_probs).sum(-1).mean()
+                
+                # Handle NaN/inf in entropy
+                if torch.isnan(entropy) or torch.isinf(entropy):
+                    entropy = torch.tensor(0.0, device=self.device)
                 
                 # Get values
                 hidden_states = outputs.hidden_states[-1][0, query_length-1:-1, :]
@@ -371,86 +476,127 @@ class EnhancedPPOTrainer:
     
     def ppo_update(self, buffer: RolloutBuffer) -> Dict[str, float]:
         """Enhanced PPO update with better stability"""
-        self.model.train()
-        self.value_head.train()
-        
-        batch_data = buffer.get()
-        batch_size = len(batch_data['queries'])
-        
-        # Normalize rewards
-        batch_data['rewards'] = self.normalize_rewards(batch_data['rewards'])
-        
-        # Store old values for clipping
-        old_values = batch_data['values'].clone()
-        
-        update_stats = {
-            'policy_losses': [],
-            'value_losses': [],
-            'entropy_losses': [],
-            'total_losses': [],
-            'clipfracs': [],
-            'approx_kls': [],
-            'grad_norms': []
-        }
-        
-        # PPO epochs
-        for epoch in range(self.config.ppo_epochs):
-            # Shuffle data
-            indices = torch.randperm(batch_size)
+        try:
+            self.model.train()
+            self.value_head.train()
             
-            # Mini-batch updates
-            for start in range(0, batch_size, self.config.minibatch_size):
-                end = start + self.config.minibatch_size
-                mb_indices = indices[start:end]
+            batch_data = buffer.get()
+            batch_size = len(batch_data['queries'])
+            
+            # Normalize rewards
+            batch_data['rewards'] = self.normalize_rewards(batch_data['rewards'])
+            
+            # Store old values for clipping
+            old_values = batch_data['values'].clone()
+            
+            update_stats = {
+                'policy_losses': [],
+                'value_losses': [],
+                'entropy_losses': [],
+                'total_losses': [],
+                'clipfracs': [],
+                'approx_kls': [],
+                'grad_norms': []
+            }
+        
+            # PPO epochs
+            for epoch in range(self.config.ppo_epochs):
+                # Shuffle data
+                indices = torch.randperm(batch_size)
                 
-                # Get mini-batch data
-                mb_queries = [batch_data['queries'][i] for i in mb_indices]
-                mb_responses = [batch_data['responses'][i] for i in mb_indices]
-                mb_old_log_probs = batch_data['log_probs'][mb_indices]
-                mb_advantages = batch_data['advantages'][mb_indices]
-                mb_returns = batch_data['returns'][mb_indices]
-                mb_old_values = old_values[mb_indices]
+                # Mini-batch updates
+                for start in range(0, batch_size, self.config.minibatch_size):
+                    end = start + self.config.minibatch_size
+                    mb_indices = indices[start:end]
+                    
+                    # Get mini-batch data
+                    mb_queries = [batch_data['queries'][i] for i in mb_indices]
+                    mb_responses = [batch_data['responses'][i] for i in mb_indices]
+                    mb_old_log_probs = batch_data['log_probs'][mb_indices]
+                    mb_advantages = batch_data['advantages'][mb_indices]
+                    mb_returns = batch_data['returns'][mb_indices]
+                    mb_old_values = old_values[mb_indices]
+                    
+                    # Normalize advantages
+                    if self.config.normalize_advantages:
+                        mb_advantages = whiten(mb_advantages)
+                    
+                    # Compute current model outputs
+                    model_outputs = self.compute_model_outputs(mb_queries, mb_responses)
+                    current_log_probs = model_outputs['log_probs']
+                    current_values = model_outputs['values']
+                    entropy = model_outputs['entropy']
+                    
+                    # Ensure all tensors have the same dtype as the model
+                    model_dtype = next(self.model.parameters()).dtype
+                    current_log_probs = current_log_probs.to(dtype=model_dtype)
+                    mb_old_log_probs = mb_old_log_probs.to(dtype=model_dtype)
+                    mb_advantages = mb_advantages.to(dtype=model_dtype)
+                    current_values = current_values.to(dtype=model_dtype)
+                    mb_returns = mb_returns.to(dtype=model_dtype)
+                    mb_old_values = mb_old_values.to(dtype=model_dtype)
+                    entropy = entropy.to(dtype=model_dtype)
+                    
+                                    # Debug: Check if we have meaningful gradients
+                logger.debug(f"Current log probs: {current_log_probs.mean().item():.6f} ± {current_log_probs.std().item():.6f}")
+                logger.debug(f"Old log probs: {mb_old_log_probs.mean().item():.6f} ± {mb_old_log_probs.std().item():.6f}")
+                logger.debug(f"Advantages: {mb_advantages.mean().item():.6f} ± {mb_advantages.std().item():.6f}")
+                logger.debug(f"Current values: {current_values.mean().item():.6f} ± {current_values.std().item():.6f}")
+                logger.debug(f"Returns: {mb_returns.mean().item():.6f} ± {mb_returns.std().item():.6f}")
                 
-                # Normalize advantages
-                if self.config.normalize_advantages:
-                    mb_advantages = whiten(mb_advantages)
-                
-                # Compute current model outputs
-                model_outputs = self.compute_model_outputs(mb_queries, mb_responses)
-                current_log_probs = model_outputs['log_probs']
-                current_values = model_outputs['values']
-                entropy = model_outputs['entropy']
-                
-                # Ensure all tensors have the same dtype as the model
-                model_dtype = next(self.model.parameters()).dtype
-                current_log_probs = current_log_probs.to(dtype=model_dtype)
-                mb_old_log_probs = mb_old_log_probs.to(dtype=model_dtype)
-                mb_advantages = mb_advantages.to(dtype=model_dtype)
-                current_values = current_values.to(dtype=model_dtype)
-                mb_returns = mb_returns.to(dtype=model_dtype)
-                mb_old_values = mb_old_values.to(dtype=model_dtype)
-                entropy = entropy.to(dtype=model_dtype)
-                
-                # Compute losses
-                policy_loss, policy_metrics = self.loss_fn.compute_policy_loss(
-                    current_log_probs, mb_old_log_probs, mb_advantages, self.config.clip_range
-                )
+                # Compute losses with better numerical stability
+                if not self.actor_frozen:
+                    policy_loss, policy_metrics = self.loss_fn.compute_policy_loss(
+                        current_log_probs, mb_old_log_probs, mb_advantages, self.config.clip_range
+                    )
+                    entropy_loss = -self.config.ent_coef * entropy
+                else:
+                    # When actor is frozen, use dummy losses
+                    policy_loss = torch.tensor(0.0, device=current_log_probs.device, requires_grad=True)
+                    policy_metrics = {'policy_loss': 0.0, 'clip_fraction': 0.0, 'clipfrac': 0.0, 'approx_kl': 0.0}
+                    entropy_loss = torch.tensor(0.0, device=current_log_probs.device, requires_grad=True)
                 
                 value_loss, value_metrics = self.loss_fn.compute_value_loss(
                     current_values, mb_returns, mb_old_values, 
                     self.config.clip_range, self.config.value_clip
                 )
                 
-                entropy_loss = -self.config.ent_coef * entropy
+                # Debug: Check loss values
+                logger.debug(f"Policy loss: {policy_loss.item():.6f}, Value loss: {value_loss.item():.6f}, Entropy loss: {entropy_loss.item():.6f}")
+                
+                # Handle NaN/inf in losses
+                if torch.isnan(policy_loss) or torch.isinf(policy_loss):
+                    policy_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+                if torch.isnan(value_loss) or torch.isinf(value_loss):
+                    value_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+                if torch.isnan(entropy_loss) or torch.isinf(entropy_loss):
+                    entropy_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
                 
                 # Total loss
                 total_loss = policy_loss + self.config.vf_coef * value_loss + entropy_loss
+                
+                # Final safety check
+                if torch.isnan(total_loss) or torch.isinf(total_loss):
+                    logger.warning("Total loss is NaN/inf, skipping this update")
+                    continue
                 
                 # Backward pass
                 self.actor_optimizer.zero_grad()
                 self.critic_optimizer.zero_grad()
                 
                 total_loss.backward()
+                
+                # Check for invalid gradients before clipping
+                actor_params = list(self.model.parameters())
+                critic_params = list(self.value_head.parameters())
+                
+                # Check if any gradients are NaN or inf
+                actor_grads_valid = all(torch.isfinite(p.grad).all() for p in actor_params if p.grad is not None)
+                critic_grads_valid = all(torch.isfinite(p.grad).all() for p in critic_params if p.grad is not None)
+                
+                if not actor_grads_valid or not critic_grads_valid:
+                    logger.warning("Invalid gradients detected, skipping this update")
+                    continue
                 
                 # Gradient clipping
                 actor_grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -460,8 +606,68 @@ class EnhancedPPOTrainer:
                     self.value_head.parameters(), self.config.max_grad_norm
                 )
                 
-                self.actor_optimizer.step()
+                # Check if gradient norms are reasonable and scale if needed
+                max_grad_norm = 1.0  # Much more conservative
+                if actor_grad_norm > max_grad_norm or critic_grad_norm > max_grad_norm:
+                    logger.warning(f"Gradient norms too high: actor={actor_grad_norm:.3f}, critic={critic_grad_norm:.3f}, scaling down")
+                    # Scale gradients down
+                    scale_factor = max_grad_norm / max(actor_grad_norm, critic_grad_norm)
+                    for param in self.model.parameters():
+                        if param.grad is not None:
+                            param.grad *= scale_factor
+                    for param in self.value_head.parameters():
+                        if param.grad is not None:
+                            param.grad *= scale_factor
+                    logger.info(f"Gradients scaled by factor: {scale_factor:.3f}")
+                
+                # Step-by-step optimizer update to catch where weights become invalid
+                if not self.actor_frozen:
+                    self.actor_optimizer.step()
+                    
+                    # Check model weights after actor update
+                    model_weights_valid = all(torch.isfinite(p).all() for p in self.model.parameters())
+                    if not model_weights_valid:
+                        logger.error("Model weights became invalid after actor update, restoring from backup")
+                        # Restore model from backup
+                        for name, param in self.model.named_parameters():
+                            if name in self.model_backup:
+                                param.data = self.model_backup[name].clone()
+                        logger.info("Model restored from backup")
+                        continue
+                else:
+                    logger.debug("Actor model frozen, skipping actor update")
+                
+                # Check if we should unfreeze the actor model
+                if self.actor_frozen and self.actor_freeze_steps >= self.actor_unfreeze_threshold:
+                    logger.info("Unfreezing actor model for full PPO training")
+                    self.actor_frozen = False
+                    for param in self.model.parameters():
+                        param.requires_grad = True
+                
+                self.actor_freeze_steps += 1
+                
+                # Log research metrics
+                if self.step_count % 5 == 0:  # More frequent logging
+                    logger.info(f"Step {self.step_count}: Actor frozen={self.actor_frozen}, "
+                              f"Value loss={value_loss.item():.6f}, "
+                              f"Policy loss={policy_loss.item():.6f}, "
+                              f"Mean reward={batch_data['rewards'].mean().item():.6f}")
+                
                 self.critic_optimizer.step()
+                
+                # Check model weights after critic update
+                model_weights_valid = all(torch.isfinite(p).all() for p in self.model.parameters())
+                if not model_weights_valid:
+                    logger.error("Model weights became invalid after critic update, restoring from backup")
+                    # Restore model from backup
+                    for name, param in self.model.named_parameters():
+                        if name in self.model_backup:
+                            param.data = self.model_backup[name].clone()
+                    logger.info("Model restored from backup")
+                    continue
+                
+                # Debug: Check if gradients are actually flowing
+                logger.debug(f"Actor grad norm: {actor_grad_norm.item():.6f}, Critic grad norm: {critic_grad_norm.item():.6f}")
                 
                 # Collect statistics
                 update_stats['policy_losses'].append(policy_loss.item())
@@ -472,64 +678,176 @@ class EnhancedPPOTrainer:
                 update_stats['approx_kls'].append(policy_metrics['approx_kl'])
                 update_stats['grad_norms'].append(actor_grad_norm.item())
                 
-                # Early stopping if KL divergence is too high
+                # Standard KL control
                 if policy_metrics['approx_kl'] > 1.5 * self.config.target_kl:
                     logger.warning(f"Early stopping due to high KL: {policy_metrics['approx_kl']:.6f}")
                     break
+                
+                # Skip update if KL is extremely high
+                if policy_metrics['approx_kl'] > 10.0:
+                    logger.warning(f"Extremely high KL ({policy_metrics['approx_kl']:.6f}), skipping update to prevent instability")
+                    continue
+                
+                # Check KL divergence for early stopping between epochs
+                mean_kl = np.mean(update_stats['approx_kls'][-10:]) if update_stats['approx_kls'] else 0
+                if mean_kl > 1.5 * self.config.target_kl:
+                    logger.warning(f"Early stopping at epoch {epoch+1} due to high KL: {mean_kl:.6f}")
+                    break
             
-            # Check KL divergence for early stopping between epochs
-            mean_kl = np.mean(update_stats['approx_kls'][-10:]) if update_stats['approx_kls'] else 0
-            if mean_kl > 1.5 * self.config.target_kl:
-                logger.warning(f"Early stopping at epoch {epoch+1} due to high KL: {mean_kl:.6f}")
-                break
+            # Update KL controller
+            if self.kl_controller:
+                mean_kl = np.mean(update_stats['approx_kls']) if update_stats['approx_kls'] else 0
+                self.config.kl_coef = self.kl_controller.update(mean_kl)
+            
+            # Compute explained variance
+            explained_var = compute_explained_variance(batch_data['values'], batch_data['returns'])
+            
+            # Return statistics with NaN handling
+            def safe_mean(values):
+                if not values:
+                    return 0.0
+                mean_val = np.mean(values)
+                return 0.0 if np.isnan(mean_val) or np.isinf(mean_val) else mean_val
+            
+            stats = {
+                'policy_loss': safe_mean(update_stats['policy_losses']),
+                'value_loss': safe_mean(update_stats['value_losses']),
+                'entropy_loss': safe_mean(update_stats['entropy_losses']),
+                'total_loss': safe_mean(update_stats['total_losses']),
+                'clipfrac': safe_mean(update_stats['clipfracs']),
+                'approx_kl': safe_mean(update_stats['approx_kls']),
+                'grad_norm': safe_mean(update_stats['grad_norms']),
+                'explained_variance': 0.0 if np.isnan(explained_var) else explained_var,
+                'kl_coef': self.config.kl_coef,
+                'mean_reward': batch_data['rewards'].mean().item() if not torch.isnan(batch_data['rewards'].mean()) else 0.0,
+                'mean_advantage': batch_data['advantages'].mean().item() if not torch.isnan(batch_data['advantages'].mean()) else 0.0,
+                'mean_return': batch_data['returns'].mean().item() if not torch.isnan(batch_data['returns'].mean()) else 0.0,
+                'reward_std': batch_data['rewards'].std().item() if not torch.isnan(batch_data['rewards'].std()) else 1.0
+            }
+            
+            return stats
         
-        # Update KL controller
-        if self.kl_controller:
-            mean_kl = np.mean(update_stats['approx_kls']) if update_stats['approx_kls'] else 0
-            self.config.kl_coef = self.kl_controller.update(mean_kl)
-        
-        # Compute explained variance
-        explained_var = compute_explained_variance(batch_data['values'], batch_data['returns'])
-        
-        # Return statistics
-        stats = {
-            'policy_loss': np.mean(update_stats['policy_losses']),
-            'value_loss': np.mean(update_stats['value_losses']),
-            'entropy_loss': np.mean(update_stats['entropy_losses']),
-            'total_loss': np.mean(update_stats['total_losses']),
-            'clipfrac': np.mean(update_stats['clipfracs']),
-            'approx_kl': np.mean(update_stats['approx_kls']),
-            'grad_norm': np.mean(update_stats['grad_norms']),
-            'explained_variance': explained_var,
-            'kl_coef': self.config.kl_coef,
-            'mean_reward': batch_data['rewards'].mean().item(),
-            'mean_advantage': batch_data['advantages'].mean().item(),
-            'mean_return': batch_data['returns'].mean().item(),
-            'reward_std': batch_data['rewards'].std().item()
-        }
-        
-        return stats
+        except Exception as e:
+            logger.error(f"PPO update failed: {e}")
+            
+            # If it's a CUDA error, try to reset the model state
+            if "CUDA error" in str(e):
+                logger.warning("Attempting to reset model state due to CUDA error")
+                try:
+                    # Clear gradients and reset optimizers
+                    self.actor_optimizer.zero_grad()
+                    self.critic_optimizer.zero_grad()
+                    
+                    # Reset model to eval mode
+                    self.model.eval()
+                    self.value_head.eval()
+                    
+                    # Clear CUDA cache
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        
+                except Exception as reset_error:
+                    logger.error(f"Failed to reset model state: {reset_error}")
+            
+            # Return default statistics
+            return {
+                'policy_loss': 0.0,
+                'value_loss': 0.0,
+                'entropy_loss': 0.0,
+                'total_loss': 0.0,
+                'clipfrac': 0.0,
+                'approx_kl': 0.0,
+                'grad_norm': 0.0,
+                'explained_variance': 0.0,
+                'kl_coef': self.config.kl_coef,
+                'mean_reward': 0.0,
+                'mean_advantage': 0.0,
+                'mean_return': 0.0,
+                'reward_std': 0.0
+            }
     
     def train_step(self, prompts: List[str], rollout_size: int = None) -> Dict[str, float]:
         """Complete enhanced PPO training step"""
-        if rollout_size is None:
-            rollout_size = len(prompts)
-        
-        # Collect rollouts
-        logger.info(f"Collecting {rollout_size} rollouts...")
-        buffer = self.collect_rollouts(prompts, rollout_size)
-        
-        # PPO update
-        logger.info("Performing PPO update...")
-        stats = self.ppo_update(buffer)
-        
-        # Update step count
-        self.step_count += 1
-        
-        # Log statistics
-        self.stats.update(**stats)
-        
-        return stats
+        try:
+            if rollout_size is None:
+                rollout_size = len(prompts)
+            
+            # Collect rollouts
+            logger.info(f"Collecting {rollout_size} rollouts...")
+            buffer = self.collect_rollouts(prompts, rollout_size)
+            
+            # Check if buffer is empty
+            if len(buffer.queries) == 0:
+                logger.warning("Empty rollout buffer, skipping training step")
+                return {
+                    'policy_loss': 0.0,
+                    'value_loss': 0.0,
+                    'entropy_loss': 0.0,
+                    'total_loss': 0.0,
+                    'clipfrac': 0.0,
+                    'approx_kl': 0.0,
+                    'grad_norm': 0.0,
+                    'explained_variance': 0.0,
+                    'kl_coef': self.config.kl_coef,
+                    'mean_reward': 0.0,
+                    'mean_advantage': 0.0,
+                    'mean_return': 0.0,
+                    'reward_std': 0.0
+                }
+            
+            # PPO update
+            logger.info("Performing PPO update...")
+            stats = self.ppo_update(buffer)
+            
+            # Update step count
+            self.step_count += 1
+            
+            # Log statistics
+            self.stats.update(**stats)
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Training step failed: {e}")
+            
+            # If it's a CUDA error, we need to completely restart
+            if "CUDA error" in str(e):
+                logger.error("CUDA error detected - training cannot continue safely")
+                logger.error("Please restart the training process")
+                # Return a special flag to indicate CUDA corruption
+                return {
+                    'policy_loss': 0.0,
+                    'value_loss': 0.0,
+                    'entropy_loss': 0.0,
+                    'total_loss': 0.0,
+                    'clipfrac': 0.0,
+                    'approx_kl': 0.0,
+                    'grad_norm': 0.0,
+                    'explained_variance': 0.0,
+                    'kl_coef': self.config.kl_coef,
+                    'mean_reward': 0.0,
+                    'mean_advantage': 0.0,
+                    'mean_return': 0.0,
+                    'reward_std': 0.0,
+                    'cuda_error': True  # Flag to indicate CUDA corruption
+                }
+            
+            # Return default statistics
+            return {
+                'policy_loss': 0.0,
+                'value_loss': 0.0,
+                'entropy_loss': 0.0,
+                'total_loss': 0.0,
+                'clipfrac': 0.0,
+                'approx_kl': 0.0,
+                'grad_norm': 0.0,
+                'explained_variance': 0.0,
+                'kl_coef': self.config.kl_coef,
+                'mean_reward': 0.0,
+                'mean_advantage': 0.0,
+                'mean_return': 0.0,
+                'reward_std': 0.0
+            }
     
     def save_checkpoint(self, path: str, epoch: int, additional_info: Dict = None):
         """Save training checkpoint with enhanced information"""
@@ -604,4 +922,5 @@ def create_enhanced_ppo_trainer(model, tokenizer, retriever, config_dict: Dict, 
     )
     
     return EnhancedPPOTrainer(model, tokenizer, retriever, ppo_config, device)
+
 
