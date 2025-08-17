@@ -8,7 +8,7 @@ from typing import List, Dict, Any, Optional
 import logging
 from huggingface_hub import login
 
-login(token = "")  # Add your HuggingFace token here
+login(token = "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")  # Add your HuggingFace token here
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,7 @@ class LlamaGenerator:
         # Start with basic model loading parameters
         model_kwargs = {
             "torch_dtype": torch.float16,
+            "low_cpu_mem_usage": True,  # Reduce CPU memory usage
         }
         
         # Only add quantization if BitsAndBytesConfig is available
@@ -107,6 +108,11 @@ class LlamaGenerator:
         # Move to device if not using device_map
         if "device_map" not in model_kwargs or model_kwargs["device_map"] is None:
             model = model.to(self.device)
+        
+        # Enable gradient checkpointing for memory efficiency
+        if hasattr(model, 'gradient_checkpointing_enable'):
+            model.gradient_checkpointing_enable()
+            logger.info("Gradient checkpointing enabled")
         
         return model
     
@@ -219,5 +225,3 @@ class LlamaGenerator:
             "vocab_size": self.tokenizer.vocab_size,
             "model_parameters": sum(p.numel() for p in self.model.parameters())
         }
-
-
