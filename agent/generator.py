@@ -225,3 +225,4 @@ class LlamaGenerator:
             "vocab_size": self.tokenizer.vocab_size,
             "model_parameters": sum(p.numel() for p in self.model.parameters())
         }
+
