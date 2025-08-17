@@ -98,9 +98,17 @@ class RolloutBuffer:
             advantages[t] = gae
             returns[t] = advantages[t] + values[t]
         
+        # Debug: Log advantage statistics
+        logger.debug(f"Raw advantages: mean={advantages.mean():.6f}, std={advantages.std():.6f}")
+        logger.debug(f"Raw returns: mean={returns.mean():.6f}, std={returns.std():.6f}")
+        logger.debug(f"Raw rewards: mean={rewards.mean():.6f}, std={rewards.std():.6f}")
+        logger.debug(f"Raw values: mean={values.mean():.6f}, std={values.std():.6f}")
+        
         # Normalize advantages
         if len(advantages) > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        logger.debug(f"Normalized advantages: mean={advantages.mean():.6f}, std={advantages.std():.6f}")
         
         self.advantages = advantages.tolist()
         self.returns = returns.tolist()
@@ -354,4 +362,6 @@ class PPOStats:
             if 'mean_' in key:
                 clean_key = key.replace('mean_', '')
                 logger.info(f"{prefix}{clean_key}: {value:.6f}")
+
+
 
