@@ -1,5 +1,4 @@
 # agent module init
-from .rag_retriever import FlexRAGRetriever
-from .generator import LLMGenerator
-from .reward_model import RewardModel
-from .consistency import Consistency
+from .rag_retriever import LlamaRetriever
+from .generator import LlamaGenerator
+from .consistency_reward import ConsistencyRewardModel, RAGConsistencyRewardModel
