@@ -144,4 +144,150 @@ logging:
   notes: "Full-scale DPO training with Llama 7B, CREAM consistency, and RAG enhancement"
 
 
+#
+# Fast DPO Training configuration (<24h) with Consistency Rewards
+device: "cuda"  # Device to use for training
+
+training:
+  # Basic parameters - FAST TRAINING
+  epochs: 3  # Reduced epochs for <24h runtime
+  learning_rate: 2e-5  # Stable LR for Llama 7B
+  batch_size: 8  # Smaller batch size for A100 memory
+  gradient_accumulation_steps: 2  # Effective batch size = 16
+  max_grad_norm: 0.5  # Standard value
+  
+  # Model parameters
+  max_input_length: 2048  # Full sequence length for Llama 7B
+  max_new_tokens: 128
+  temperature: 0.7
+  
+  # DPO-specific hyperparameters
+  dpo_beta: 0.1
+  dpo_method: "original"
+  
+  # Consistency reward settings
+  lambda_consistency: 0.5
+  lambda_retrieval: 0.1
+  consistency_method: "spearman"
+  num_candidates: 3
+  
+  # Training stability settings
+  normalize_rewards: true
+  reward_clipping: true
+  reward_clip_range: 10.0
+  
+  # Training strategies
+  use_direct_document_training: true
+  direct_training_ratio: 0.3
+  top_k_variance: true
+  
+  # Optional: separate questions file
+  questions_path: "data/combined/questions.jsonl"
+  
+  # Data parameters - REDUCED FOR <24h
+  max_questions_from_corpus: 20000  # Cut from 50k → ~20k for speed
+  context_length_limit: 1000
+  document_truncation_limit: 500
+  
+  # Optimizer settings
+  optimizer: "adamw"
+  weight_decay: 0.01
+  scheduler: "cosine"
+  
+  # Logging and saving - FAST TRAINING
+  log_interval: 10
+  eval_interval: 200
+  save_interval: 1
+  save_path: "/root/CREAMRAG/checkpoints/rag_cream_fast_dpo"
+  
+  # DPO specific settings
+  preference_buffer_size: 1024  # Reduced buffer to save memory
+  
+  # LoRA settings
+  use_lora: true
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.1
+  
+  # Quantization
+  use_4bit: false
+  use_8bit: false
+  
+  # Flash attention
+  use_flash_attention: true
+  
+  # Checkpointing
+  save_total_limit: 5  # Keep fewer checkpoints
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_loss"
+  greater_is_better: false
+  
+  # Logging
+  report_to: []
+  run_name: "dpo_llama7b_cream_fast"
+
+# Model configuration
+model:
+  name: "meta-llama/Llama-2-7b-hf"
+  max_length: 2048
+  context_length: 1600
+  
+# RAG configuration
+rag:
+  top_k: 6  # Slightly reduced for faster retrieval
+  max_doc_length: 800  # Reduced for speed
+  max_context_length: 1600
+  use_rag_enhancement: true
+
+# Retriever configuration
+retriever:
+  document_path: "data/corpus.jsonl"
+  index_path: "index_embeddings"
+  top_k: 6
+  
+# Data sources - REDUCED SAMPLE COUNTS
+datasets:
+  - name: "hotpot_qa"
+    path: "data/hotpot_qa"
+    max_samples: 2000
+    
+  - name: "natural_questions"
+    path: "data/natural_questions"
+    max_samples: 2000
+    
+  - name: "crag"
+    path: "data/crag"
+    max_samples: 2000
+    
+  - name: "squad"
+    path: "data/squad"
+    max_samples: 2000
+    
+  - name: "trivia_qa"
+    path: "data/trivia_qa"
+    max_samples: 2000
+    
+  - name: "ragbench"
+    path: "data/ragbench"
+    max_samples: 2000
+
+# Evaluation configuration
+evaluation:
+  metrics: ["exact_match", "f1_score", "consistency"]
+  eval_batch_size: 8
+  max_eval_samples: 200
+  
+# Logging configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  
+logging:
+  project: "dpo-llama7b-cream-fast"
+  entity: null
+  tags: ["dpo", "llama7b", "cream", "consistency", "rag", "fast"]
+  notes: "Fast DPO training (<24h) with Llama 7B, consistency rewards, and RAG"
+
+#
+
 
