@@ -1,61 +1,21 @@
-# RAG Cream PPO Training Configuration
+# Enhanced DPO Training configuration with Consistency Rewards
+device: "cuda"  # Device to use for training
 
-# Device configuration
-device: "cuda:0"  # Use GPU for training
-
-# Retriever configuration
-retriever:
-  # Dataset options:
-  # - "data/corpus.jsonl" (original: 70K mixed documents)
-  # - "data/enhanced_corpus.jsonl" (original + 10K Wikipedia articles)
-  # - "data/wikipedia_corpus.jsonl" (50K Wikipedia articles only)
-  document_path: "data/combined/articles.jsonl"  # Path to your document corpus
-  embedding_path: "index_embeddings/doc_embeddings.npy"  # Path to precomputed embeddings
-  top_k: 5  # Number of documents to retrieve
-
-# Generator (LLM) configuration
-generator:
-  model: "meta-llama/Llama-2-7b-chat-hf"  # Your LLaMA model path
-  max_new_tokens: 256
-  temperature: 0.7
-  use_8bit: false  # Disable quantization for stability
-  use_4bit: false  # Disable 4-bit for better performance
-  use_flash_attention: true  # Enable flash attention for A100 performance
-  gradient_checkpointing: true  # Enable gradient checkpointing for memory efficiency
-
-# Reward model configuration
-reward_model:
-  model: "meta-llama/Llama-2-7b-chat-hf"  # Can be same as generator
-  gradient_checkpointing: true  # Enable gradient checkpointing for memory efficiency
-
-# Enhanced PPO Training configuration with Consistency Rewards
 training:
-  # Basic parameters - Optimized for speed
-  epochs: 3  # Fewer epochs for faster training
-  learning_rate: 5e-6  # Balanced learning rate
-  batch_size: 1  # Smaller batch for faster processing
+  # Basic parameters - FULL SCALE TRAINING
+  epochs: 5  # Full training epochs
+  learning_rate: 2e-5  # Optimized for Llama 7B
+  batch_size: 8  # Larger batch size for full training
   max_grad_norm: 0.5  # Standard value
   
   # Model parameters
-  max_input_length: 64  # Smaller for faster generation
-  max_new_tokens: 8  # Smaller for faster generation
+  max_input_length: 2048  # Full sequence length for Llama 7B
+  max_new_tokens: 128  # Standard generation length
   temperature: 0.7
   
-  # PPO-specific hyperparameters
-  clip_range: 0.1         # Standard PPO clip range
-  vf_coef: 0.5            # Standard value function coefficient
-  ent_coef: 0.01          # Standard entropy coefficient
-  gamma: 0.99              # Discount factor
-  gae_lambda: 0.95         # GAE lambda parameter
-  ppo_epochs: 1            # Single epoch for stability
-  minibatch_size: 1        # Single sample for stability
-  target_kl: 0.05          # Reasonable target KL
-  
-  # Value function settings
-  normalize_advantages: true    # Whether to normalize advantages
-  value_clip: true             # Whether to clip value function loss
-  value_lr_multiplier: 1.0     # Learning rate multiplier for value head
-  adaptive_kl: true            # Use adaptive KL control
+  # DPO-specific hyperparameters
+  dpo_beta: 0.1            # DPO beta parameter
+  dpo_method: "original"   # DPO method: original, consistency_avg, consistency_dyn
   
   # Consistency reward settings
   lambda_consistency: 0.5      # Weight for consistency reward
@@ -64,13 +24,9 @@ training:
   num_candidates: 3            # Number of candidates for consistency evaluation
   
   # Training stability settings
-  use_gae: true               # Use Generalized Advantage Estimation
   normalize_rewards: true     # Normalize rewards using running statistics
   reward_clipping: true       # Clip rewards to prevent extreme values
   reward_clip_range: 10.0     # Range for reward clipping
-  
-  # Loss weights (legacy - now handled by lambda_consistency and lambda_retrieval)
-  lambda_reward: 1.0
   
   # Training strategies
   use_direct_document_training: true
@@ -80,24 +36,112 @@ training:
   # Optional: separate questions file
   questions_path: "data/combined/questions.jsonl"
   
-  # Data parameters
-  max_questions_from_corpus: 50  # Much smaller for faster training
-  context_length_limit: 200
-  document_truncation_limit: 100
+  # Data parameters - FULL SCALE TRAINING
+  max_questions_from_corpus: 50000  # Use full dataset
+  context_length_limit: 1000
+  document_truncation_limit: 500
   
   # Optimizer settings
   optimizer: "adamw"  # or "adam"
   weight_decay: 0.01
   scheduler: "cosine"  # or "linear" or null
   
-  # Logging and saving
-  log_interval: 10
-  eval_interval: 100
-  save_interval: 2
-  save_path: "checkpoints/rag_cream_enhanced_ppo"
+  # Logging and saving - ENHANCED FOR PRODUCTION
+  log_interval: 5  # More frequent logging
+  eval_interval: 50  # More frequent evaluation
+  save_interval: 1  # Save every epoch
+  save_path: "/root/CREAMRAG/checkpoints/rag_cream_enhanced_dpo"
   
-  # PPO specific settings
-  rollout_buffer_size: 2048    # Size of experience buffer
+  # DPO specific settings
+  preference_buffer_size: 2048    # Size of preference buffer
+  
+  # LoRA settings for efficient fine-tuning
+  use_lora: true
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.1
+  
+  # Quantization settings for memory efficiency
+  use_4bit: false
+  use_8bit: false
+  
+  # Flash attention for performance
+  use_flash_attention: true
+  
+  # Checkpointing for research
+  save_total_limit: 10  # Keep last 10 checkpoints
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_loss"
+  greater_is_better: false
+  
+  # Logging for research tracking
+  report_to: []  # No external logging
+  run_name: "dpo_llama7b_cream_consistency"
+  
+  # DPO settings (already defined above)
+
+# Model configuration
+model:
+  name: "meta-llama/Llama-2-7b-hf"  # Correct Llama 7B model path
+  max_length: 2048
+  context_length: 1600  # Increased for RAG context
+  
+# RAG configuration
+rag:
+  top_k: 8
+  max_doc_length: 1000
+  max_context_length: 1600
+  use_rag_enhancement: true
+
+# Retriever configuration
+retriever:
+  document_path: "data/corpus.jsonl"  # Path to document corpus
+  index_path: "index_embeddings"  # Path to FAISS index
+  top_k: 8
+  
+# Data sources - ALL DATASETS INCLUDED (FULL SIZE)
+datasets:
+  - name: "hotpot_qa"
+    path: "data/hotpot_qa"
+    max_samples: 50  # Small dataset for testing
+    
+  - name: "natural_questions"
+    path: "data/natural_questions" 
+    max_samples: 50  # Small dataset for testing
+    
+  - name: "crag"
+    path: "data/crag"
+    max_samples: 50  # Small dataset for testing
+    
+  - name: "squad"
+    path: "data/squad"
+    max_samples: 50  # Small dataset for testing
+    
+  - name: "trivia_qa"
+    path: "data/trivia_qa"
+    max_samples: 50  # Small dataset for testing
+    
+  - name: "ragbench"
+    path: "data/ragbench"
+    max_samples: 50  # Small dataset for testing
+
+# Evaluation configuration
+evaluation:
+  metrics: ["exact_match", "f1_score", "consistency"]
+  eval_batch_size: 8
+  max_eval_samples: 50
+
+# Logging configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  
+# Logging configuration
+logging:
+  project: "dpo-llama7b-cream"
+  entity: null  # Will use default
+  tags: ["dpo", "llama7b", "cream", "consistency", "rag"]
+  notes: "Full-scale DPO training with Llama 7B, CREAM consistency, and RAG enhancement"
 
 
 
