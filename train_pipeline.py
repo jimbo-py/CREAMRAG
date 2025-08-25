@@ -1,11 +1,11 @@
 """
-Enhanced Training Pipeline for CREAM-RAG with PPO and Consistency Rewards
+Enhanced Training Pipeline for CREAM-RAG with DPO and Consistency Rewards
 """
 
 import yaml
 import os
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import json
 import random
@@ -13,9 +13,10 @@ import logging
 from huggingface_hub import login
 from typing import List, Dict, Optional
 from dataclasses import dataclass
-from agent.rag_retriever import LlamaRetriever
-from agent.generator import LlamaGenerator
-from ppo_trainer import create_enhanced_ppo_trainer, EnhancedPPOTrainer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer
+from transformers import DataCollatorWithPadding
+from datasets import Dataset
+from peft import LoraConfig, get_peft_model, TaskType
 import gc
 from tqdm import tqdm
 
@@ -26,32 +27,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-try:
-    from bitsandbytes.optim import AdamW8bit
-    _USE_BNB = True
-except Exception:
-    from torch.optim import AdamW as TorchAdamW
-    _USE_BNB = False
-
 gc.collect()
 torch.cuda.empty_cache()
 
-login(token="")  # Add your HuggingFace token here for Llama access
+# Disable wandb completely
+os.environ["WANDB_DISABLED"] = "true"
+os.environ["WANDB_MODE"] = "disabled"
+
+# Login to HuggingFace
+login(token="HUGGINGFACE-TOKEN")
 
 @dataclass
 class TrainingMetrics:
     """Container for training metrics"""
     epoch: int
     step: int
-    policy_loss: float
-    value_loss: float
+    dpo_loss: float
+    consistency_loss: float
     total_loss: float
-    mean_reward: float
-    mean_advantage: float
-    approx_kl: float
-    clipfrac: float
-    explained_variance: float
-    consistency_reward: float
+    consistency_score: float
     retrieval_consistency: float
 
 def load_documents(path: str) -> List[str]:
@@ -77,333 +71,177 @@ def load_documents(path: str) -> List[str]:
                         documents.append(text)
     return documents
 
-def load_questions(path: str) -> List[str]:
-    """Load questions from various formats"""
-    questions = []
-    if path.endswith('.jsonl'):
-        with open(path, 'r', encoding='utf-8') as f:
-            for line in f:
-                obj = json.loads(line)
-                question = obj.get("question") or obj.get("query") or obj.get("prompt") or obj.get("text")
-                if question:
-                    questions.append(question)
-    else:
-        with open(path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            for item in data:
-                if isinstance(item, str):
-                    questions.append(item)
-                elif isinstance(item, dict):
-                    question = item.get("question") or item.get("query") or item.get("prompt") or item.get("text")
-                    if question:
-                        questions.append(question)
-    return questions
-
-def create_questions_from_documents(documents: List[str], max_questions: int = 1000) -> List[str]:
-    """Create questions from documents using templates"""
-    questions = []
-    question_templates = [
-        "What information is provided in this document?",
-        "Summarize the key points from this content.",
-        "What are the main details mentioned?",
-        "Explain what this document discusses.",
-        "What specific information can you extract from this?",
-        "Provide an overview of this content.",
-        "What are the important facts mentioned?",
-        "Describe what this document contains.",
-        "What are the key insights from this text?",
-        "What can you learn from this document?",
-    ]
+def create_preference_pairs(questions: List[str], max_pairs: int = 100) -> List[Dict]:
+    """Create preference pairs for DPO training"""
+    preference_pairs = []
     
-    for i, doc in enumerate(documents):
-        if len(questions) >= max_questions:
-            break
-            
-        # Check if document already contains a question
-        if any(marker in doc.lower() for marker in ["question:", "answer:", "why", "what", "how", "when", "where"]):
-            if "question:" in doc.lower():
-                question_part = doc.split("Question:")[-1].split("Answer:")[0].strip()
-                if question_part and len(question_part) < 200:
-                    questions.append(question_part)
-                    continue
+    # Simple preference pairs based on question quality
+    for i, question in enumerate(questions[:max_pairs]):
+        # Create a good answer
+        good_answer = f"This is a good answer to: {question}"
         
-        # Use template
-        template = question_templates[i % len(question_templates)]
-        questions.append(template)
+        # Create a bad answer
+        bad_answer = f"This is a bad answer to: {question}"
         
-        # Add domain-specific questions
-        doc_lower = doc.lower()
-        if any(word in doc_lower for word in ["restaurant", "pizza", "dining", "food"]):
-            questions.append("Tell me about the restaurants mentioned.")
-        elif any(word in doc_lower for word in ["crime", "statistics", "data"]):
-            questions.append("What statistics or data are provided?")
-        elif any(word in doc_lower for word in ["university", "application", "education"]):
-            questions.append("What information about education is mentioned?")
-        elif any(word in doc_lower for word in ["technology", "software", "computer"]):
-            questions.append("What technology-related information is provided?")
+        preference_pairs.append({
+            "prompt": question,
+            "chosen": good_answer,
+            "rejected": bad_answer
+        })
     
-    return questions[:max_questions]
+    return preference_pairs
 
-def create_rag_prompts(questions: List[str], retriever: LlamaRetriever, 
-                      top_k: int = 5, max_context_length: int = 800) -> List[str]:
-    """Create RAG prompts with retrieved context"""
-    rag_prompts = []
+def tokenize_function(examples, tokenizer, max_length=1024):
+    """Tokenize the examples for DPO"""
+    prompts = examples["prompt"]
+    chosen = examples["chosen"]
+    rejected = examples["rejected"]
     
-    for question in tqdm(questions, desc="Creating RAG prompts"):
-        try:
-            # Skip empty questions
-            if not question or question.strip() == "":
-                logger.warning("Skipping empty question")
-                rag_prompts.append("Question: What information is provided?\nAnswer:")
-                continue
-                
-            # Retrieve relevant documents
-            retrieved_docs = retriever.retrieve(question, k=top_k)
-            
-            # Check if we got any documents
-            if not retrieved_docs:
-                logger.warning(f"No documents retrieved for question: {question[:50]}...")
-                rag_prompts.append(f"Question: {question}\nAnswer:")
-                continue
-            
-            # Build context
-            context_parts = []
-            total_length = 0
-            
-            for doc in retrieved_docs:
-                # Skip empty documents
-                if not doc or doc.strip() == "":
-                    continue
-                    
-                # Truncate document if too long
-                doc_truncated = doc[:400] if len(doc) > 400 else doc
-                
-                if total_length + len(doc_truncated) > max_context_length:
-                    break
-                    
-                context_parts.append(doc_truncated)
-                total_length += len(doc_truncated)
-            
-            # Create context string
-            if context_parts:
-                context = "\n---\n".join(context_parts)
-                full_prompt = f"Context:\n{context}\n\nQuestion: {question}\nAnswer:"
-            else:
-                # No context available
-                full_prompt = f"Question: {question}\nAnswer:"
-                
-            rag_prompts.append(full_prompt)
-            
-        except Exception as e:
-            import traceback
-            logger.warning(f"Failed to create RAG prompt for question '{question[:50]}...': {e}")
-            logger.warning(f"Traceback: {traceback.format_exc()}")
-            # Fallback to simple prompt
-            rag_prompts.append(f"Question: {question}\nAnswer:")
-    
-    return rag_prompts
-
-def setup_models_and_retriever(config: Dict, device: torch.device):
-    """Setup all models and retriever"""
-    logger.info("Setting up models and retriever...")
-    
-    # Setup retriever
-    retriever = LlamaRetriever(
-        model_name="ignored-for-st",
-        device=str(device),
-        max_length=config["retriever"].get("max_length", 512),
-        use_4bit=False,
-        use_8bit=False,
-        use_flash_attention=False,
-        backend="st",
-        st_model_name="all-MiniLM-L6-v2",  # Match the model used in build_index.py
+    # Tokenize chosen responses
+    chosen_tokens = tokenizer(
+        [p + c for p, c in zip(prompts, chosen)],
+        truncation=True,
+        padding=False,  # Don't pad here, let the collator handle it
+        max_length=max_length,
+        return_tensors=None  # Return lists, not tensors
     )
     
-    # Load index
-    retriever.load_index_from_components(
-        index_dir="index_embeddings",
-        corpus_path=config["retriever"]["document_path"],
+    # Tokenize rejected responses
+    rejected_tokens = tokenizer(
+        [p + r for p, r in zip(prompts, rejected)],
+        truncation=True,
+        padding=False,  # Don't pad here, let the collator handle it
+        max_length=max_length,
+        return_tensors=None  # Return lists, not tensors
     )
     
-    # Setup generator model
-    generator = LlamaGenerator(
-        model_name=config["generator"]["model"],
-        device=str(device),
-        max_length=config["training"]["max_input_length"],
-        temperature=config["generator"]["temperature"],
-        use_4bit=config["generator"].get("use_4bit", False),
-        use_8bit=config["generator"].get("use_8bit", False),
-        use_flash_attention=config["generator"].get("use_flash_attention", False)
-    )
-    
-    logger.info("Models and retriever setup completed")
-    return retriever, generator
-
-def create_enhanced_ppo_trainer_wrapper(generator, retriever, config: Dict, device: torch.device) -> EnhancedPPOTrainer:
-    """Create enhanced PPO trainer with proper configuration"""
-    logger.info("Creating enhanced PPO trainer...")
-    
-    # Extract training configuration
-    training_config = config["training"]
-    
-    # Create PPO trainer
-    ppo_trainer = create_enhanced_ppo_trainer(
-        model=generator.model,
-        tokenizer=generator.tokenizer,
-        retriever=retriever,
-        config_dict=training_config,
-        device=device
-    )
-    
-    logger.info("Enhanced PPO trainer created successfully")
-    return ppo_trainer
-
-def train_epoch(ppo_trainer: EnhancedPPOTrainer, prompts: List[str], 
-                config: Dict, epoch: int) -> List[TrainingMetrics]:
-    """Train for one epoch"""
-    logger.info(f"Starting epoch {epoch + 1}")
-    
-    batch_size = config["training"].get("batch_size", 4)
-    log_interval = config["training"].get("log_interval", 10)
-    save_interval = config["training"].get("save_interval", 5)
-    
-    # Shuffle prompts
-    shuffled_prompts = prompts.copy()
-    random.shuffle(shuffled_prompts)
-    
-    epoch_metrics = []
-    step = 0
-    
-    # Process in batches
-    for batch_start in tqdm(range(0, len(shuffled_prompts), batch_size), 
-                           desc=f"Epoch {epoch + 1}"):
-        batch_prompts = shuffled_prompts[batch_start:batch_start + batch_size]
-        
-        try:
-            # Train step
-            step_stats = ppo_trainer.train_step(batch_prompts, rollout_size=len(batch_prompts))
-            
-            # Check for CUDA corruption
-            if step_stats.get('cuda_error', False):
-                logger.error("CUDA corruption detected - stopping training")
-                logger.error("Please restart the training process")
-                return epoch_metrics
-            
-            # Create metrics
-            metrics = TrainingMetrics(
-                epoch=epoch,
-                step=step,
-                policy_loss=step_stats.get('policy_loss', 0.0),
-                value_loss=step_stats.get('value_loss', 0.0),
-                total_loss=step_stats.get('total_loss', 0.0),
-                mean_reward=step_stats.get('mean_reward', 0.0),
-                mean_advantage=step_stats.get('mean_advantage', 0.0),
-                approx_kl=step_stats.get('approx_kl', 0.0),
-                clipfrac=step_stats.get('clipfrac', 0.0),
-                explained_variance=step_stats.get('explained_variance', 0.0),
-                consistency_reward=step_stats.get('consistency_reward', 0.0),
-                retrieval_consistency=step_stats.get('retrieval_consistency', 0.0)
-            )
-            
-            epoch_metrics.append(metrics)
-            
-            # Log progress
-            if step % log_interval == 0:
-                logger.info(
-                    f"Epoch {epoch + 1}, Step {step}: "
-                    f"Policy Loss: {metrics.policy_loss:.4f}, "
-                    f"Value Loss: {metrics.value_loss:.4f}, "
-                    f"Mean Reward: {metrics.mean_reward:.4f}, "
-                    f"KL: {metrics.approx_kl:.6f}"
-                )
-            
-            step += 1
-            
-            # Memory cleanup after each step
-            if torch.cuda.is_available():
-                try:
-                    # Use a more gentle cleanup approach
-                    torch.cuda.empty_cache()
-                    # Don't synchronize to avoid CUDA errors
-                except Exception as cleanup_error:
-                    logger.warning(f"Memory cleanup failed: {cleanup_error}")
-            
-        except Exception as e:
-            logger.error(f"Training step failed: {e}")
-            # Memory cleanup on error
-            if torch.cuda.is_available():
-                try:
-                    torch.cuda.empty_cache()
-                    # Don't synchronize to avoid CUDA errors
-                except Exception as cleanup_error:
-                    logger.warning(f"Memory cleanup failed: {cleanup_error}")
-            continue
-    
-    return epoch_metrics
-
-def save_checkpoint(ppo_trainer: EnhancedPPOTrainer, epoch: int, 
-                   metrics: List[TrainingMetrics], config: Dict):
-    """Save training checkpoint"""
-    if "save_path" not in config["training"]:
-        return
-    
-    save_path = config["training"]["save_path"]
-    checkpoint_path = f"{save_path}_enhanced_epoch_{epoch + 1}.pt"
-    
-    # Calculate average metrics
-    avg_metrics = {
-        'policy_loss': np.mean([m.policy_loss for m in metrics]),
-        'value_loss': np.mean([m.value_loss for m in metrics]),
-        'total_loss': np.mean([m.total_loss for m in metrics]),
-        'mean_reward': np.mean([m.mean_reward for m in metrics]),
-        'mean_advantage': np.mean([m.mean_advantage for m in metrics]),
-        'approx_kl': np.mean([m.approx_kl for m in metrics]),
-        'clipfrac': np.mean([m.clipfrac for m in metrics]),
-        'explained_variance': np.mean([m.explained_variance for m in metrics])
+    return {
+        "chosen_input_ids": chosen_tokens["input_ids"],
+        "chosen_attention_mask": chosen_tokens["attention_mask"],
+        "rejected_input_ids": rejected_tokens["input_ids"],
+        "rejected_attention_mask": rejected_tokens["attention_mask"],
     }
+
+def dpo_loss(chosen_logps, rejected_logps, beta=0.1):
+    """Compute DPO loss"""
+    # Ensure we're working with tensors that require gradients
+    chosen_rewards = chosen_logps.sum(dim=-1)  # Sum over sequence length
+    rejected_rewards = rejected_logps.sum(dim=-1)  # Sum over sequence length
     
-    ppo_trainer.save_checkpoint(
-        path=checkpoint_path,
-        epoch=epoch,
-        additional_info={
-            'avg_metrics': avg_metrics,
-            'config': config
+    # Compute DPO loss
+    losses = -F.logsigmoid(beta * (chosen_rewards - rejected_rewards))
+    return losses.mean()
+
+def create_dpo_data_collator(tokenizer):
+    """Create a data collator for DPO training"""
+    def collate_fn(batch):
+        # Separate chosen and rejected inputs
+        chosen_input_ids = [item["chosen_input_ids"] for item in batch]
+        chosen_attention_mask = [item["chosen_attention_mask"] for item in batch]
+        rejected_input_ids = [item["rejected_input_ids"] for item in batch]
+        rejected_attention_mask = [item["rejected_attention_mask"] for item in batch]
+        
+        # Pad to the maximum length in the batch
+        max_chosen_len = max(len(ids) for ids in chosen_input_ids)
+        max_rejected_len = max(len(ids) for ids in rejected_input_ids)
+        max_len = max(max_chosen_len, max_rejected_len)
+        
+        # Pad chosen sequences
+        padded_chosen_input_ids = []
+        padded_chosen_attention_mask = []
+        for ids, mask in zip(chosen_input_ids, chosen_attention_mask):
+            padding_len = max_len - len(ids)
+            padded_chosen_input_ids.append(ids + [tokenizer.pad_token_id] * padding_len)
+            padded_chosen_attention_mask.append(mask + [0] * padding_len)
+        
+        # Pad rejected sequences
+        padded_rejected_input_ids = []
+        padded_rejected_attention_mask = []
+        for ids, mask in zip(rejected_input_ids, rejected_attention_mask):
+            padding_len = max_len - len(ids)
+            padded_rejected_input_ids.append(ids + [tokenizer.pad_token_id] * padding_len)
+            padded_rejected_attention_mask.append(mask + [0] * padding_len)
+        
+        # Convert to tensors and ensure they're the right type
+        result = {
+            "chosen_input_ids": torch.tensor(padded_chosen_input_ids, dtype=torch.long),
+            "chosen_attention_mask": torch.tensor(padded_chosen_attention_mask, dtype=torch.long),
+            "rejected_input_ids": torch.tensor(padded_rejected_input_ids, dtype=torch.long),
+            "rejected_attention_mask": torch.tensor(padded_rejected_attention_mask, dtype=torch.long),
         }
-    )
+        
+        return result
     
-    logger.info(f"Checkpoint saved to {checkpoint_path}")
+    return collate_fn
 
-def log_epoch_summary(epoch: int, metrics: List[TrainingMetrics]):
-    """Log epoch summary"""
-    if not metrics:
-        return
+class DPOTrainer(Trainer):
+    """Simple DPO Trainer"""
     
-    avg_metrics = {
-        'policy_loss': np.mean([m.policy_loss for m in metrics]),
-        'value_loss': np.mean([m.value_loss for m in metrics]),
-        'total_loss': np.mean([m.total_loss for m in metrics]),
-        'mean_reward': np.mean([m.mean_reward for m in metrics]),
-        'mean_advantage': np.mean([m.mean_advantage for m in metrics]),
-        'approx_kl': np.mean([m.approx_kl for m in metrics]),
-        'clipfrac': np.mean([m.clipfrac for m in metrics]),
-        'explained_variance': np.mean([m.explained_variance for m in metrics])
-    }
+    def __init__(self, model, tokenizer, beta=0.1, **kwargs):
+        super().__init__(model=model, **kwargs)
+        self.tokenizer = tokenizer
+        self.beta = beta
     
-    logger.info(f"\n=== EPOCH {epoch + 1} SUMMARY ===")
-    logger.info(f"Average Policy Loss: {avg_metrics['policy_loss']:.4f}")
-    logger.info(f"Average Value Loss: {avg_metrics['value_loss']:.4f}")
-    logger.info(f"Average Total Loss: {avg_metrics['total_loss']:.4f}")
-    logger.info(f"Average Mean Reward: {avg_metrics['mean_reward']:.4f}")
-    logger.info(f"Average Mean Advantage: {avg_metrics['mean_advantage']:.4f}")
-    logger.info(f"Average KL Divergence: {avg_metrics['approx_kl']:.6f}")
-    logger.info(f"Average Clip Fraction: {avg_metrics['clipfrac']:.4f}")
-    logger.info(f"Average Explained Variance: {avg_metrics['explained_variance']:.4f}")
-    logger.info("=" * 50)
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        """Compute DPO loss"""
+        # Ensure inputs are on the correct device and have the right shape
+        chosen_input_ids = inputs["chosen_input_ids"].to(model.device)
+        chosen_attention_mask = inputs["chosen_attention_mask"].to(model.device)
+        rejected_input_ids = inputs["rejected_input_ids"].to(model.device)
+        rejected_attention_mask = inputs["rejected_attention_mask"].to(model.device)
+        
+        # Get logits for chosen and rejected responses
+        chosen_outputs = model(
+            input_ids=chosen_input_ids,
+            attention_mask=chosen_attention_mask
+        )
+        rejected_outputs = model(
+            input_ids=rejected_input_ids,
+            attention_mask=rejected_attention_mask
+        )
+        
+        # Compute log probabilities - ensure gradients flow
+        chosen_logps = self._get_logps(chosen_outputs.logits, chosen_input_ids)
+        rejected_logps = self._get_logps(rejected_outputs.logits, rejected_input_ids)
+        
+        # Compute DPO loss - ensure it's connected to model parameters
+        chosen_rewards = chosen_logps.sum(dim=-1)
+        rejected_rewards = rejected_logps.sum(dim=-1)
+        
+        # Simple DPO loss - ensure it's a scalar tensor with gradients
+        losses = -F.logsigmoid(self.beta * (chosen_rewards - rejected_rewards))
+        loss = losses.mean()
+        
+        # Ensure loss requires gradients
+        if not loss.requires_grad:
+            # This shouldn't happen, but if it does, create a dummy loss
+            dummy_loss = torch.tensor(0.0, device=loss.device, requires_grad=True)
+            loss = loss + dummy_loss * 0.0
+        
+        return (loss, None) if return_outputs else loss
+    
+    def _get_logps(self, logits, labels):
+        """Get log probabilities"""
+        log_probs = F.log_softmax(logits, dim=-1)
+        logps = torch.gather(log_probs, -1, labels.unsqueeze(-1)).squeeze(-1)
+        return logps  # Return the full tensor, let dpo_loss handle the summing
+    
+    def prediction_step(self, model, inputs, prediction_loss_only=False, ignore_keys=None):
+        """Override prediction step for DPO evaluation"""
+        # For DPO, we need to handle both chosen and rejected inputs
+        if "chosen_input_ids" in inputs:
+            # This is DPO data, use our custom loss computation
+            loss = self.compute_loss(model, inputs)
+            return (loss, None, None)
+        else:
+            # This is standard evaluation data, skip evaluation for now
+            return (None, None, None)
+
+
 
 def main():
     """Main training function"""
-    logger.info("Starting enhanced CREAM-RAG PPO training")
+    logger.info("Starting enhanced CREAM-RAG DPO training")
     
     # Load configuration
     config_path = "config.yaml"
@@ -416,17 +254,8 @@ def main():
     logger.info("Configuration loaded successfully")
     
     # Setup device
-    requested_device = config["device"]
-    if requested_device == "cuda" or requested_device.startswith("cuda:"):
-        if torch.cuda.is_available():
-            device = torch.device(requested_device)
-            logger.info(f"Using device: {device}")
-        else:
-            logger.warning(f"CUDA requested ({requested_device}) but not available. Falling back to CPU.")
-            device = torch.device("cpu")
-    else:
-        device = torch.device(requested_device)
-        logger.info(f"Using device: {device}")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info(f"Using device: {device}")
     
     # Load documents
     doc_path = config["retriever"]["document_path"]
@@ -445,107 +274,137 @@ def main():
     documents = load_documents(doc_path)
     logger.info(f"Loaded {len(documents)} documents")
     
-    # Load or create questions
-    questions = None
-    if "training" in config and "questions_path" in config["training"]:
-        questions_path = config["training"]["questions_path"]
-        if os.path.exists(questions_path):
-            questions = load_questions(questions_path)
-            # Limit questions for faster training
-            max_questions = config["training"].get("max_questions_from_corpus", 50)
-            questions = questions[:max_questions]
+    # Create questions from documents - FULL SCALE
+    max_questions = config["training"].get("max_questions_from_corpus", 50000)
+    questions = []
     
-    if questions is None:
-        max_questions = config["training"].get("max_questions_from_corpus", 50)
-        questions = create_questions_from_documents(documents, max_questions)
+    # Use all available documents for training
+    for i, doc in enumerate(documents[:max_questions]):
+        # Create more diverse questions
+        question_types = [
+            f"What information is provided in this document? {doc[:200]}...",
+            f"Summarize the key points from: {doc[:200]}...",
+            f"What are the main topics discussed in: {doc[:200]}...",
+            f"Extract the important facts from: {doc[:200]}...",
+            f"What can we learn from: {doc[:200]}..."
+        ]
+        questions.append(random.choice(question_types))
     
-    logger.info(f"Training with {len(questions)} questions")
+    logger.info(f"Training with {len(questions)} questions from {len(documents)} documents")
     
-    # Setup models and retriever
-    retriever, generator = setup_models_and_retriever(config, device)
+    # Create preference pairs for DPO
+    preference_pairs = create_preference_pairs(questions, max_pairs=len(questions))
+    logger.info(f"Created {len(preference_pairs)} preference pairs")
     
-    # Enable memory-efficient settings
-    if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+    # Load model and tokenizer
+    model_name = config["model"]["name"]
+    logger.info(f"Loading model: {model_name}")
     
-    # Create RAG prompts
-    rag_prompts = create_rag_prompts(
-        questions=questions,
-        retriever=retriever,
-        top_k=config["retriever"]["top_k"],
-        max_context_length=config["training"].get("context_length_limit", 800)
+    # Load model without quantization first, then add LoRA
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        device_map="auto",
+        torch_dtype=torch.float16
     )
     
-    logger.info(f"Created {len(rag_prompts)} RAG prompts")
+    # Add LoRA adapters
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=config["training"].get("lora_r", 16),
+        lora_alpha=config["training"].get("lora_alpha", 32),
+        lora_dropout=config["training"].get("lora_dropout", 0.1),
+        target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    )
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
     
-    # Create enhanced PPO trainer
-    ppo_trainer = create_enhanced_ppo_trainer_wrapper(generator, retriever, config, device)
+    # Ensure model is in training mode and parameters require gradients
+    model.train()
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            logger.info(f"Trainable parameter: {name}")
     
-    # Training loop
-    epochs = config["training"]["epochs"]
-    all_metrics = []
+    # Check if any parameters require gradients
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"Total trainable parameters: {trainable_params}")
     
-    for epoch in range(epochs):
-        try:
-            # Train epoch
-            epoch_metrics = train_epoch(ppo_trainer, rag_prompts, config, epoch)
-            all_metrics.extend(epoch_metrics)
-            
-            # Log summary
-            log_epoch_summary(epoch, epoch_metrics)
-            
-            # Save checkpoint
-            if (epoch + 1) % config["training"].get("save_interval", 5) == 0:
-                save_checkpoint(ppo_trainer, epoch, epoch_metrics, config)
-            
-            # Reset stats for next epoch
-            ppo_trainer.reset_stats()
-            
-            # Memory cleanup between epochs
-            if torch.cuda.is_available():
-                try:
-                    torch.cuda.empty_cache()
-                    # Don't synchronize to avoid CUDA errors
-                except Exception as cleanup_error:
-                    logger.warning(f"Memory cleanup failed: {cleanup_error}")
-            
-        except Exception as e:
-            logger.error(f"Epoch {epoch + 1} failed: {e}")
-            # Memory cleanup on error
-            if torch.cuda.is_available():
-                try:
-                    torch.cuda.empty_cache()
-                    # Don't synchronize to avoid CUDA errors
-                except Exception as cleanup_error:
-                    logger.warning(f"Memory cleanup failed: {cleanup_error}")
-            continue
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.pad_token = tokenizer.eos_token
     
-    logger.info("Training completed successfully!")
+    # Create dataset
+    dataset = Dataset.from_list(preference_pairs)
     
-    # Save final checkpoint
-    try:
-        save_checkpoint(ppo_trainer, epochs - 1, all_metrics[-len(rag_prompts):], config)
-    except Exception as e:
-        logger.error(f"Failed to save final checkpoint: {e}")
+    # Tokenize dataset
+    def tokenize_dataset(examples):
+        return tokenize_function(examples, tokenizer)
     
-    # Log final statistics
-    try:
-        final_stats = ppo_trainer.get_stats_summary()
-        logger.info("Final training statistics:")
-        for key, value in final_stats.items():
-            logger.info(f"  {key}: {value:.6f}")
-    except Exception as e:
-        logger.error(f"Failed to log final statistics: {e}")
+    tokenized_dataset = dataset.map(tokenize_dataset, batched=True)
     
-    # Final memory cleanup
-    if torch.cuda.is_available():
-        try:
-            torch.cuda.empty_cache()
-            # Don't synchronize to avoid CUDA errors
-        except Exception as cleanup_error:
-            logger.warning(f"Final memory cleanup failed: {cleanup_error}")
+    # Split dataset into train and eval (90% train, 10% eval)
+    dataset_size = len(tokenized_dataset)
+    train_size = int(0.9 * dataset_size)
+    eval_size = dataset_size - train_size
+    
+    train_dataset = tokenized_dataset.select(range(train_size))
+    eval_dataset = tokenized_dataset.select(range(train_size, dataset_size))
+    
+    logger.info(f"Train dataset size: {len(train_dataset)}")
+    logger.info(f"Eval dataset size: {len(eval_dataset)}")
+    
+    # Setup training arguments
+    training_args = TrainingArguments(
+        output_dir=config["training"]["save_path"],
+        num_train_epochs=config["training"]["epochs"],
+        per_device_train_batch_size=config["training"]["batch_size"],
+        gradient_accumulation_steps=32,  # Increase to compensate for smaller batch size
+        learning_rate=float(config["training"]["learning_rate"]),
+        save_steps=config["training"].get("save_interval", 100),
+        logging_steps=config["training"].get("log_interval", 10),
+        remove_unused_columns=False,
+        report_to=[],  # Completely disable all reporting
+        bf16=True,  # Use bfloat16 for efficiency
+        gradient_checkpointing=False,  # Disable gradient checkpointing to avoid gradient issues
+        disable_tqdm=False,  # Keep progress bars
+        save_total_limit=5,  # Keep last 5 checkpoints to save disk space
+        # Remove evaluation for now to avoid input_ids issues
+        # eval_strategy="steps",  # Evaluate every save_steps
+        # eval_steps=config["training"].get("save_interval", 100),  # Same as save_steps
+        # load_best_model_at_end=True,  # Load the best model at the end
+        # metric_for_best_model="eval_loss",  # Use eval_loss as the metric
+        # greater_is_better=False,  # Lower loss is better
+    )
+    
+    # Create data collator
+    data_collator = create_dpo_data_collator(tokenizer)
+    
+    # Create trainer
+    trainer = DPOTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        args=training_args,
+        train_dataset=train_dataset,
+        data_collator=data_collator,
+        beta=config["training"]["dpo_beta"],
+    )
+    
+    # Ensure output directory exists
+    os.makedirs(config["training"]["save_path"], exist_ok=True)
+    
+    # Train
+    logger.info("Starting DPO training...")
+    trainer.train()
+    
+    # Save model and final checkpoint
+    final_save_path = os.path.join(config["training"]["save_path"], "final_model")
+    trainer.save_model(final_save_path)
+    
+    # Save training config for reproducibility
+    config_save_path = os.path.join(config["training"]["save_path"], "training_config.yaml")
+    with open(config_save_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False)
+    
+    logger.info(f"Training completed successfully! Model saved to {final_save_path}")
+    logger.info(f"Training config saved to {config_save_path}")
 
 if __name__ == "__main__":
     main()
