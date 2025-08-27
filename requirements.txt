@@ -1,7 +1,6 @@
-
 transformers>=4.40.0
 trl>=0.7.10
-torch>=2.0.0
+torch>=2.1.0  # Updated for better A100 support
 datasets
 scikit-learn
 faiss-cpu
@@ -17,3 +16,4 @@ simple_parsing
 huggingface_hub
 scipy
 tqdm
+# flash-attn>=2.3.0  # Flash attention for A100 optimization - disabled to avoid import errors
