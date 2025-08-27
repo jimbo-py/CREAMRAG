@@ -20,6 +20,26 @@ from peft import LoraConfig, get_peft_model, TaskType
 import gc
 from tqdm import tqdm
 
+# Import CUDA optimization utilities
+try:
+    from cuda_optimization import setup_cuda_optimizations, monitor_gpu_memory, get_optimal_batch_size
+except ImportError:
+    # Fallback if cuda_optimization.py is not available
+    def setup_cuda_optimizations():
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+    
+    def monitor_gpu_memory():
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            print(f"GPU Memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
+    
+    def get_optimal_batch_size(model_size_gb, sequence_length=2048):
+        return 4  # Default fallback
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -27,15 +47,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-gc.collect()
-torch.cuda.empty_cache()
+# Setup CUDA optimizations
+setup_cuda_optimizations()
 
 # Disable wandb completely
 os.environ["WANDB_DISABLED"] = "true"
 os.environ["WANDB_MODE"] = "disabled"
 
 # Login to HuggingFace
-login(token="HUGGINGFACE-TOKEN")
+login(token="")
 
 @dataclass
 class TrainingMetrics:
@@ -253,9 +273,19 @@ def main():
     
     logger.info("Configuration loaded successfully")
     
-    # Setup device
+    # Setup device and CUDA optimizations
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Using device: {device}")
+    
+    if device == "cuda":
+        # Monitor GPU memory
+        monitor_gpu_memory()
+        
+        # Calculate optimal batch size for Llama 7B
+        optimal_batch = get_optimal_batch_size(7.0, config["training"].get("max_input_length", 2048))
+        if optimal_batch != config["training"]["batch_size"]:
+            logger.info(f"Recommended batch size: {optimal_batch}, current: {config['training']['batch_size']}")
+            config["training"]["batch_size"] = optimal_batch
     
     # Load documents
     doc_path = config["retriever"]["document_path"]
@@ -300,11 +330,19 @@ def main():
     model_name = config["model"]["name"]
     logger.info(f"Loading model: {model_name}")
     
-    # Load model without quantization first, then add LoRA
+    # Load model with optimized CUDA settings for A100
+    model_kwargs = {
+        "device_map": "auto",
+        "torch_dtype": torch.bfloat16 if config["training"].get("use_bf16", True) else torch.float32,
+    }
+    
+    # Add flash attention if enabled
+    if config["training"].get("flash_attention", True):
+        model_kwargs["attn_implementation"] = "flash_attention_2"
+    
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        device_map="auto",
-        torch_dtype=torch.float16
+        **model_kwargs
     )
     
     # Add LoRA adapters
@@ -317,6 +355,19 @@ def main():
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
+    
+    # Enable gradient checkpointing for memory efficiency
+    if config["training"].get("gradient_checkpointing", True):
+        model.gradient_checkpointing_enable()
+        logger.info("Enabled gradient checkpointing for memory efficiency")
+    
+    # Compile model for A100 optimization if enabled
+    if config["training"].get("compile_model", True):
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            logger.info("Model compiled with torch.compile for A100 optimization")
+        except Exception as e:
+            logger.warning(f"Model compilation failed: {e}. Continuing without compilation.")
     
     # Ensure model is in training mode and parameters require gradients
     model.train()
@@ -351,21 +402,24 @@ def main():
     logger.info(f"Train dataset size: {len(train_dataset)}")
     logger.info(f"Eval dataset size: {len(eval_dataset)}")
     
-    # Setup training arguments
+    # Setup training arguments with CUDA optimizations for A100
     training_args = TrainingArguments(
         output_dir=config["training"]["save_path"],
         num_train_epochs=config["training"]["epochs"],
         per_device_train_batch_size=config["training"]["batch_size"],
-        gradient_accumulation_steps=32,  # Increase to compensate for smaller batch size
+        gradient_accumulation_steps=config["training"].get("gradient_accumulation_steps", 8),
         learning_rate=float(config["training"]["learning_rate"]),
         save_steps=config["training"].get("save_interval", 100),
         logging_steps=config["training"].get("log_interval", 10),
         remove_unused_columns=False,
         report_to=[],  # Completely disable all reporting
-        bf16=True,  # Use bfloat16 for efficiency
-        gradient_checkpointing=False,  # Disable gradient checkpointing to avoid gradient issues
+        bf16=config["training"].get("use_bf16", True),  # Use bfloat16 for A100 efficiency
+        fp16=config["training"].get("use_fp16", False),  # Disable fp16 to avoid conflicts
+        gradient_checkpointing=config["training"].get("gradient_checkpointing", True),  # Enable for memory efficiency
         disable_tqdm=False,  # Keep progress bars
-        save_total_limit=5,  # Keep last 5 checkpoints to save disk space
+        save_total_limit=config["training"].get("save_total_limit", 5),  # Keep last 5 checkpoints
+        dataloader_pin_memory=True,  # Optimize data loading
+        dataloader_num_workers=4,  # Optimize data loading
         # Remove evaluation for now to avoid input_ids issues
         # eval_strategy="steps",  # Evaluate every save_steps
         # eval_steps=config["training"].get("save_interval", 100),  # Same as save_steps
@@ -392,7 +446,16 @@ def main():
     
     # Train
     logger.info("Starting DPO training...")
+    
+    # Monitor memory before training
+    if device == "cuda":
+        monitor_gpu_memory()
+    
     trainer.train()
+    
+    # Monitor memory after training
+    if device == "cuda":
+        monitor_gpu_memory()
     
     # Save model and final checkpoint
     final_save_path = os.path.join(config["training"]["save_path"], "final_model")
@@ -411,6 +474,4 @@ if __name__ == "__main__":
 
 
 
-if __name__ == "__main__":
-    main()
 
