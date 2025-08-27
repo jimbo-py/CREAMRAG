@@ -248,11 +248,15 @@ class DPOTrainer:
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         
-        # Load policy model with quantization
+        # Load policy model with optimized CUDA settings for A100
         model_kwargs = {
             "device_map": "auto" if self.config.device == "auto" else None,
             "torch_dtype": torch.bfloat16 if self.config.bf16 else torch.float32,
         }
+        
+        # Add flash attention if enabled
+        if hasattr(self.config, 'use_flash_attention') and self.config.use_flash_attention:
+            model_kwargs["attn_implementation"] = "flash_attention_2"
         
         # Add quantization if enabled
         if hasattr(self.config, 'use_4bit') and self.config.use_4bit:
@@ -620,6 +624,10 @@ def main():
     trainer.evaluate()
     
     logger.info("DPO training completed successfully!")
+
+if __name__ == "__main__":
+    main()
+
 
 if __name__ == "__main__":
     main()
