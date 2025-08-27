@@ -31,7 +31,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # HuggingFace token for accessing restricted datasets
-HF_TOKEN = "HUGGING-FACETOKEN"
+HF_TOKEN = None  # Set to None to use public datasets only
 
 def create_directory(path: str):
     """Create directory if it doesn't exist"""
@@ -415,7 +415,7 @@ def main():
     parser.add_argument("--max-samples", type=int, default=None,
                        help="Maximum samples per dataset (None for full dataset)")
     parser.add_argument("--datasets", type=str, nargs="+", 
-                       default=["trivia_qa", "crag", "ragbench"],  # Focus on remaining datasets
+                       default=["hotpot_qa", "natural_questions", "trivia_qa", "crag", "ragbench"],  # All datasets
                        help="Datasets to prepare")
     
     args = parser.parse_args()
@@ -426,24 +426,23 @@ def main():
     # Prepare datasets
     all_datasets = []
     
-    # Comment out already processed datasets
-    # if "hotpot_qa" in args.datasets:
-    #     hotpot_dir = os.path.join(args.output_dir, "hotpot_qa")
-    #     create_directory(hotpot_dir)
-    #     hotpot_data = prepare_hotpot_qa(hotpot_dir, args.max_samples)
-    #     all_datasets.append(("hotpot_qa", hotpot_data))
+    if "hotpot_qa" in args.datasets:
+        hotpot_dir = os.path.join(args.output_dir, "hotpot_qa")
+        create_directory(hotpot_dir)
+        hotpot_data = prepare_hotpot_qa(hotpot_dir, args.max_samples)
+        all_datasets.append(("hotpot_qa", hotpot_data))
     
-    # if "natural_questions" in args.datasets:
-    #     nq_dir = os.path.join(args.output_dir, "natural_questions")
-    #     create_directory(nq_dir)
-    #     nq_data = prepare_natural_questions(nq_dir, args.max_samples)
-    #     all_datasets.append(("natural_questions", nq_data))
+    if "natural_questions" in args.datasets:
+        nq_dir = os.path.join(args.output_dir, "natural_questions")
+        create_directory(nq_dir)
+        nq_data = prepare_natural_questions(nq_dir, args.max_samples)
+        all_datasets.append(("natural_questions", nq_data))
     
-    # if "squad" in args.datasets:
-    #     squad_dir = os.path.join(args.output_dir, "squad")
-    #     create_directory(squad_dir)
-    #     squad_data = prepare_squad(squad_dir, args.max_samples)
-    #     all_datasets.append(("squad", squad_data))
+    if "squad" in args.datasets:
+        squad_dir = os.path.join(args.output_dir, "squad")
+        create_directory(squad_dir)
+        squad_data = prepare_squad(squad_dir, args.max_samples)
+        all_datasets.append(("squad", squad_data))
     
     if "trivia_qa" in args.datasets:
         trivia_dir = os.path.join(args.output_dir, "trivia_qa")
@@ -482,3 +481,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
