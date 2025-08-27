@@ -1,0 +1,193 @@
+# RunPod Optimized Configuration for CREAM-RAG Training
+# This config saves all data to persistent storage and enables regular evaluation
+
+device: "cuda"  # Device to use for training
+
+training:
+  # Basic parameters - OPTIMIZED FOR A100 80GB
+  epochs: 5  # Full training epochs
+  learning_rate: 2e-5  # Optimized for Llama 7B
+  batch_size: 4  # Optimized for A100 80GB memory efficiency
+  gradient_accumulation_steps: 8  # Effective batch size = 32
+  max_grad_norm: 0.5  # Standard value
+  
+  # Model parameters
+  max_input_length: 2048  # Full sequence length for Llama 7B
+  max_new_tokens: 128  # Standard generation length
+  temperature: 0.7
+  
+  # DPO-specific hyperparameters
+  dpo_beta: 0.1            # DPO beta parameter
+  dpo_method: "original"   # DPO method: original, consistency_avg, consistency_dyn
+  
+  # Consistency reward settings
+  lambda_consistency: 0.5      # Weight for consistency reward
+  lambda_retrieval: 0.1        # Weight for retrieval consistency
+  consistency_method: "spearman"  # Consistency method: "spearman", "kendall", "toporder"
+  num_candidates: 3            # Number of candidates for consistency evaluation
+  
+  # Training stability settings
+  normalize_rewards: true     # Normalize rewards using running statistics
+  reward_clipping: true       # Clip rewards to prevent extreme values
+  reward_clip_range: 10.0     # Range for reward clipping
+  
+  # Training strategies
+  use_direct_document_training: true
+  direct_training_ratio: 0.3
+  top_k_variance: true
+  
+  # Optional: separate questions file
+  questions_path: "/workspace/data/combined/questions.jsonl"
+  
+  # Data parameters - FULL SCALE TRAINING
+  max_questions_from_corpus: 50000  # Use full dataset
+  context_length_limit: 1000
+  document_truncation_limit: 500
+  
+  # Optimizer settings
+  optimizer: "adamw"  # or "adam"
+  weight_decay: 0.01
+  scheduler: "cosine"  # or "linear" or null
+  
+  # Logging and saving - RUNPOD PERSISTENT STORAGE
+  log_interval: 5  # More frequent logging
+  eval_interval: 100  # Evaluate every 100 steps
+  save_interval: 500  # Save every 500 steps (more frequent for RunPod)
+  save_path: "/workspace/checkpoints/rag_cream_enhanced_dpo"  # Persistent storage
+  
+  # DPO specific settings
+  preference_buffer_size: 2048    # Size of preference buffer
+  
+  # LoRA settings for efficient fine-tuning
+  use_lora: true
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.1
+  
+  # CUDA OPTIMIZATIONS FOR A100 80GB
+  use_4bit: false
+  use_8bit: false
+  use_bf16: true  # Use bfloat16 for A100 efficiency
+  use_fp16: false  # Disable fp16 to avoid conflicts
+  gradient_checkpointing: true  # Enable for memory efficiency
+  flash_attention: false  # Disable flash attention to avoid import errors
+  compile_model: false  # Disable torch.compile to avoid compilation hanging
+  
+  # Checkpointing for RunPod persistence
+  save_total_limit: 20  # Keep more checkpoints for safety
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_loss"
+  greater_is_better: false
+  
+  # Evaluation settings for RunPod
+  evaluation_strategy: "steps"  # Evaluate during training
+  eval_steps: 100  # Evaluate every 100 steps
+  eval_accumulation_steps: 4  # Accumulate eval batches
+  
+  # Logging for research tracking
+  report_to: []  # No external logging
+  run_name: "dpo_llama7b_cream_runpod"
+  
+  # RunPod specific settings
+  dataloader_pin_memory: true
+  dataloader_num_workers: 4
+  remove_unused_columns: false
+
+# Model configuration
+model:
+  name: "meta-llama/Llama-2-7b-hf"  # Correct Llama 7B model path
+  max_length: 2048
+  context_length: 1600  # Increased for RAG context
+  
+# RAG configuration
+rag:
+  top_k: 8
+  max_doc_length: 1000
+  max_context_length: 1600
+  use_rag_enhancement: true
+
+# Retriever configuration - PERSISTENT STORAGE
+retriever:
+  document_path: "/workspace/data/corpus.jsonl"  # Path to document corpus
+  index_path: "/workspace/index_embeddings"  # Path to FAISS index
+  top_k: 8
+  
+# Data sources - PERSISTENT STORAGE PATHS
+datasets:
+  - name: "hotpot_qa"
+    path: "/workspace/data/hotpot_qa"
+    max_samples: 1000  # Increased for better evaluation
+    
+  - name: "natural_questions"
+    path: "/workspace/data/natural_questions" 
+    max_samples: 1000  # Increased for better evaluation
+    
+  - name: "crag"
+    path: "/workspace/data/crag"
+    max_samples: 500  # Increased for better evaluation
+    
+  - name: "squad"
+    path: "/workspace/data/squad"
+    max_samples: 1000  # Increased for better evaluation
+    
+  - name: "trivia_qa"
+    path: "/workspace/data/trivia_qa"
+    max_samples: 1000  # Increased for better evaluation
+    
+  - name: "ragbench"
+    path: "/workspace/data/ragbench"
+    max_samples: 500  # Increased for better evaluation
+
+# Evaluation configuration - ENHANCED FOR RUNPOD
+evaluation:
+  metrics: ["exact_match", "f1_score", "consistency", "rouge", "bleu"]
+  eval_batch_size: 4  # Reduced for memory efficiency
+  max_eval_samples: 1000  # Increased for better evaluation
+  eval_split: "validation"  # Use validation split for evaluation
+  
+  # Evaluation datasets
+  eval_datasets:
+    - name: "hotpot_qa"
+      path: "/workspace/data/hotpot_qa/hotpot_qa_validation.jsonl"
+      max_samples: 500
+    - name: "squad"
+      path: "/workspace/data/squad/squad_validation.jsonl"
+      max_samples: 500
+    - name: "trivia_qa"
+      path: "/workspace/data/trivia_qa/trivia_qa.jsonl"
+      max_samples: 500
+
+# Logging configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  project: "dpo-llama7b-cream-runpod"
+  entity: null  # Will use default
+  tags: ["dpo", "llama7b", "cream", "consistency", "rag", "runpod"]
+  notes: "RunPod optimized DPO training with persistent storage and regular evaluation"
+  
+  # Logging paths
+  log_dir: "/workspace/logs"
+  tensorboard_dir: "/workspace/tensorboard"
+  
+# RunPod specific settings
+runpod:
+  # Persistent storage paths
+  data_dir: "/workspace/data"
+  checkpoints_dir: "/workspace/checkpoints"
+  logs_dir: "/workspace/logs"
+  models_dir: "/workspace/models"
+  
+  # Auto-save settings
+  auto_save_interval: 300  # Save every 5 minutes
+  backup_interval: 1800    # Backup every 30 minutes
+  
+  # Evaluation settings
+  eval_during_training: true
+  eval_frequency: 100      # Evaluate every 100 steps
+  save_eval_results: true  # Save evaluation results
+  
+  # Model checkpointing
+  save_model_checkpoints: true
+  save_optimizer_state: true
+  save_scheduler_state: true
