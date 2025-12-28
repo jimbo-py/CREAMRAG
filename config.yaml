@@ -1,0 +1,138 @@
+# Enhanced DPO Training configuration with Consistency Rewards - OPTIMIZED FOR H200 SXM
+device: "cuda"  # Device to use for training
+
+training:
+  # Basic parameters - OPTIMIZED FOR LIMITED TRAINING (10K samples)
+  epochs: 3  # Reduced epochs for smaller dataset
+  learning_rate: 2e-5  # Optimized for Llama 7B
+  batch_size: 8  # Optimized for H200 SXM memory efficiency
+  gradient_accumulation_steps: 4  # Effective batch size = 32
+  max_grad_norm: 0.5  # Standard value
+  
+  # Model parameters
+  max_input_length: 2048  # Full sequence length for Llama 7B
+  max_new_tokens: 128  # Standard generation length
+  temperature: 0.7
+  
+  # DPO-specific hyperparameters
+  dpo_beta: 0.1            # DPO beta parameter
+  dpo_method: "original"   # DPO method: original, consistency_avg, consistency_dyn
+  
+  # Consistency reward settings
+  lambda_consistency: 0.5      # Weight for consistency reward
+  lambda_retrieval: 0.1        # Weight for retrieval consistency
+  consistency_method: "spearman"  # Consistency method: "spearman", "kendall", "toporder"
+  num_candidates: 3            # Number of candidates for consistency evaluation
+  
+  # Training stability settings
+  normalize_rewards: true     # Normalize rewards using running statistics
+  reward_clipping: true       # Clip rewards to prevent extreme values
+  reward_clip_range: 10.0     # Range for reward clipping
+  
+  # Training strategies
+  use_direct_document_training: true
+  direct_training_ratio: 0.3
+  top_k_variance: true
+  
+  # Training data path - Using combined dataset
+  train_data_path: "qa_data/combined_100000.jsonl"
+  
+  # Optional: separate questions file
+  questions_path: "data/combined/questions.jsonl"
+  
+  # Data parameters - LIMITED TRAINING (10K samples)
+  max_questions_from_corpus: 10000  # Limited dataset for faster training
+  max_samples: 10000  # Limit training samples to 10K
+  context_length_limit: 1000
+  document_truncation_limit: 500
+  
+  # Optimizer settings
+  optimizer: "adamw"  # or "adam"
+  weight_decay: 0.01
+  scheduler: "cosine"  # or "linear" or null
+  
+  # Logging and saving - ENHANCED FOR PRODUCTION
+  log_interval: 10  # Optimized for H200 speed
+  eval_interval: 100  # Optimized for H200 speed
+  save_interval: 1  # Save every epoch
+  save_path: "./checkpoints/rag_cream_enhanced_dpo"
+  
+  # DPO specific settings
+  preference_buffer_size: 2048    # Size of preference buffer
+  
+  # LoRA settings for efficient fine-tuning
+  use_lora: true
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.1
+  
+  # CUDA OPTIMIZATIONS FOR H200 SXM (141GB HBM3)
+  use_4bit: false
+  use_8bit: false
+  use_bf16: true  # Use bfloat16 for H200 efficiency
+  use_fp16: false  # Disable fp16 to avoid conflicts
+  gradient_checkpointing: false  # Disable for H200 - not needed with 141GB
+  flash_attention: false  # Disable flash attention - not installed
+  compile_model: false  # Disable torch.compile - conflicts with LoRA
+  
+  # Checkpointing for research
+  save_total_limit: 10  # Keep last 10 checkpoints
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_loss"
+  greater_is_better: false
+  
+  # Logging for research tracking
+  report_to: []  # No external logging
+  run_name: "dpo_llama7b_cream_consistency"
+
+# Model configuration
+model:
+  name: "meta-llama/Llama-4-Scout-17B-16E"  # Multimodal model
+  max_length: 2048
+  context_length: 1600  # Increased for RAG context
+  
+# RAG configuration
+rag:
+  top_k: 8
+  max_doc_length: 1000
+  max_context_length: 1600
+  use_rag_enhancement: true
+
+# Retriever configuration
+retriever:
+  document_path: "data/corpus.jsonl"  # Path to document corpus
+  index_path: "index_embeddings"  # Path to FAISS index
+  top_k: 8
+  
+# Data sources - ONLY RAGTRUTH AND MS MARCO DATASETS
+datasets:
+  - name: "ragtruth"
+    path: "/workspace/cream_rag_data/backups/20250902_021122/CREAMRAG/data/ragtruth"
+    max_samples: null  # Use full dataset
+    
+  - name: "ms_marco"
+    path: "/workspace/cream_rag_data/backups/20250902_021122/CREAMRAG/data/ms_marco"
+    max_samples: null  # Use full dataset
+
+# Evaluation configuration
+evaluation:
+  metrics: ["exact_match", "f1_score", "consistency"]
+  eval_batch_size: 4  # Reduced for memory efficiency
+  max_eval_samples: 1000  # Increased for better evaluation
+
+# Logging configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  project: "dpo-llama7b-cream"
+  entity: null  # Will use default
+  tags: ["dpo", "llama7b", "cream", "consistency", "rag"]
+  notes: "Full-scale DPO training with Llama 7B, CREAM consistency, and RAG enhancement"
+
+
+
+
+
+#
+
+
