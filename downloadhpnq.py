@@ -1,12 +1,11 @@
 from datasets import load_dataset
 import os
 
-# Directory to save data
+
 save_dir = "qa_data"
 os.makedirs(save_dir, exist_ok=True)
 
-# Correct Hugging Face dataset IDs and loading parameters
-# Format: (local_name, hf_id, config_name_or_none, split)
+
 datasets_to_download = [
     ("hotpot_qa", "hotpotqa/hotpot_qa", "distractor", "train"),
     ("natural_questions", "sentence-transformers/natural-questions", None, "train"),
@@ -17,7 +16,7 @@ for name, hf_id, config_name, split in datasets_to_download:
 
     dataset = None
     try:
-        # Try loading with config name (if provided) and split
+        
         if config_name:
             dataset = load_dataset(hf_id, config_name, split=split)
         else:
@@ -25,7 +24,7 @@ for name, hf_id, config_name, split in datasets_to_download:
     except Exception as e1:
         print(f"⚠️  First attempt failed: {e1}")
         try:
-            # Try loading without split, then access split
+           
             if config_name:
                 full_dataset = load_dataset(hf_id, config_name)
             else:
@@ -33,7 +32,7 @@ for name, hf_id, config_name, split in datasets_to_download:
             if split in full_dataset:
                 dataset = full_dataset[split]
             else:
-                # If requested split not found, use the first available split
+               
                 first_split = list(full_dataset.keys())[0]
                 print(f"⚠️  No '{split}' split found, using '{first_split}' split instead")
                 dataset = full_dataset[first_split]
@@ -45,7 +44,7 @@ for name, hf_id, config_name, split in datasets_to_download:
         print(f"❌ Could not load {hf_id}")
         continue
 
-    # Save training split as JSONL
+    
     save_path = os.path.join(save_dir, f"{name}_train.jsonl")
     dataset.to_json(save_path, orient="records", lines=True)
     print(f"✅ Saved {name} training split to {save_path}")
