@@ -23,9 +23,9 @@ class LlamaGenerator:
                  temperature: float = 0.7,
                  top_p: float = 0.9,
                  repetition_penalty: float = 1.1,
-                 use_4bit: bool = False,  # Changed default to False to avoid issues
-                 use_8bit: bool = False,  # Changed default to False to avoid memory issues  
-                 use_flash_attention: bool = False):  # Changed default to False
+                 use_4bit: bool = False,  
+                 use_8bit: bool = False,  
+                 use_flash_attention: bool = False):  
         
         self.model_name = model_name
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -54,13 +54,13 @@ class LlamaGenerator:
                                      use_8bit: bool, use_flash_attention: bool):
         """Load model with GPU optimizations"""
         
-        # Start with basic model loading parameters
+       
         model_kwargs = {
             "torch_dtype": torch.float16,
-            "low_cpu_mem_usage": True,  # Reduce CPU memory usage
+            "low_cpu_mem_usage": True,  
         }
         
-        # Only add quantization if BitsAndBytesConfig is available
+      
         quantization_config = None
         if use_4bit or use_8bit:
             try:
@@ -85,10 +85,10 @@ class LlamaGenerator:
             except ImportError:
                 logger.warning("BitsAndBytesConfig not available, using standard loading")
         
-        # Only set flash attention if explicitly requested and available
+      
         if use_flash_attention:
             try:
-                # Test if flash_attn is available
+              
                 import flash_attn
                 model_kwargs["attn_implementation"] = "flash_attention_2"
                 logger.info("Using FlashAttention 2")
@@ -106,7 +106,7 @@ class LlamaGenerator:
             # Fallback to basic loading
             model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
         
-        # Move to device if not using device_map
+       
         if "device_map" not in model_kwargs or model_kwargs["device_map"] is None:
             model = model.to(self.device)
         
@@ -151,7 +151,7 @@ class LlamaGenerator:
                 eos_token_id=self.tokenizer.eos_token_id
             )
         
-        # Decode response
+        # Decode 
         generated_text = self.tokenizer.decode(
             outputs[0][inputs['input_ids'].shape[1]:], 
             skip_special_tokens=True
@@ -164,7 +164,7 @@ class LlamaGenerator:
                       top_p: Optional[float] = None) -> List[str]:
         """Generate text for multiple prompts"""
         
-        # Use instance defaults if not specified
+        
         if temperature is None:
             temperature = self.temperature
         if top_p is None:
