@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+
 """
 Combine all JSONL files from qa_data directory into a single combined file.
 Uses the same normalization and deduplication logic as download_datasets.py
@@ -12,7 +12,7 @@ import random
 from collections import OrderedDict
 from glob import glob
 
-# Copy normalization functions from download_datasets.py
+
 def normalize_answers_from_example(ex):
     """Try common patterns to extract answers as list of strings."""
     if ex is None:
@@ -130,12 +130,12 @@ def combine_qa_files(data_dir, max_combined=100000, seed=42):
             for line_num, line in enumerate(f, 1):
                 try:
                     ex = json.loads(line.strip())
-                    # Check if already normalized (has question, context, answers, source)
+                    
                     if all(k in ex for k in ["question", "context", "answers", "source"]):
-                        # Already normalized, use as-is
+                       
                         norm = ex
                     else:
-                        # Need normalization
+                     
                         norm = normalize_example(dataset_name, ex)
                     if norm is not None:
                         dataset_examples.append(norm)
@@ -143,7 +143,10 @@ def combine_qa_files(data_dir, max_combined=100000, seed=42):
                     print(f"  ⚠️  Skipping invalid JSON at line {line_num}: {e}")
                     continue
         
-        # Dedupe within dataset
+
+
+
+        
         dataset_examples = dedupe_examples(dataset_examples)
         per_dataset_counts[dataset_name] = len(dataset_examples)
         print(f"  -> {dataset_name}: {len(dataset_examples)} normalized examples")
@@ -153,28 +156,28 @@ def combine_qa_files(data_dir, max_combined=100000, seed=42):
     print("\n=== Combined before dedupe ===")
     print(f"Total collected examples (raw combined): {len(combined)}")
     
-    # Dedupe across datasets
+  
     combined = dedupe_examples(combined)
     print(f"After cross-dataset deduplication: {len(combined)}")
     
-    # Shuffle
+    
     random.shuffle(combined)
     
-    # Sample down if needed
+   
     if len(combined) > max_combined:
         print(f"Sampling down to {max_combined} examples (seed={seed})")
         combined = combined[:max_combined]
     else:
         print(f"Total combined {len(combined)} <= max_combined {max_combined}; using all")
     
-    # Write combined file
+   
     combined_path = os.path.join(data_dir, f"combined_{len(combined)}.jsonl")
     with open(combined_path, "w", encoding="utf-8") as f:
         for ex in combined:
             f.write(json.dumps(ex, ensure_ascii=False) + "\n")
     print(f"\n✅ Wrote combined file: {combined_path}")
     
-    # Print summary
+
     print("\n=== Summary ===")
     print(f"Per-dataset counts:")
     for name, count in per_dataset_counts.items():
