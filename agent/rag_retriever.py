@@ -34,8 +34,8 @@ class LlamaRetriever:
         use_4bit: bool = False,
         use_8bit: bool = True,
         use_flash_attention: bool = False,
-        backend: str = "llama",                 # "llama" or "st"
-        st_model_name: Optional[str] = None,    # e.g. "intfloat/e5-base-v2"
+        backend: str = "llama",                
+        st_model_name: Optional[str] = None,    
     ):
         self.model_name = model_name
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -74,7 +74,6 @@ class LlamaRetriever:
 
         logger.info("Retriever initialized successfully.")
 
-    # ---------------------------- LLAMA BACKEND ----------------------------
 
     def _load_model_with_optimizations(self, model_name: str, use_4bit: bool, use_8bit: bool, use_flash_attention: bool):
         model_kwargs = {"torch_dtype": torch.float16}
@@ -97,7 +96,7 @@ class LlamaRetriever:
 
         if use_flash_attention:
             try:
-                import flash_attn  # noqa: F401
+                import flash_attn  
                 model_kwargs["attn_implementation"] = "flash_attention_2"
                 logger.info("Using FlashAttention 2")
             except ImportError:
@@ -139,12 +138,12 @@ class LlamaRetriever:
                     pooled = masked.sum(dim=1) / attn.sum(dim=1)  # [B, H]
                     embeddings.append(pooled.cpu().numpy())
             finally:
-                # free VRAM ASAP
+        
                 del inputs
                 torch.cuda.empty_cache()
         return np.vstack(embeddings)
 
-    # ---------------------- SENTENCE-TRANSFORMERS BACKEND ----------------------
+
 
     def _encode_texts_st(self, texts: List[str]) -> np.ndarray:
         """SentenceTransformers encode with normalized embeddings (cosine)."""
@@ -157,7 +156,7 @@ class LlamaRetriever:
         )
         return embs.astype("float32")
 
-    # ----------------------------- COMMON UTILS -----------------------------
+  
 
     def encode_texts(self, texts: List[str]) -> np.ndarray:
         if self.backend == "llama":
@@ -178,7 +177,7 @@ class LlamaRetriever:
                     docs.append(data)
         logger.info(f"Loaded {len(docs)} documents")
         self.documents = docs
-        # If your JSONL has 'id', keep them; otherwise enumerate:
+      
         try:
             with open(document_path, "r", encoding="utf-8") as f:
                 ids = []
@@ -192,7 +191,6 @@ class LlamaRetriever:
         self.doc_ids = ids
         return docs
 
-    # ------------------------------ INDEX I/O -------------------------------
 
     def build_index(self, documents: List[str], save_path: Optional[str] = None):
         """Build FAISS index from documents for the **current backend**."""
@@ -200,11 +198,11 @@ class LlamaRetriever:
         embs = self.encode_texts(documents)
 
         if self.backend == "llama":
-            # Use IP over normalized vectors (cosine)
+      
             faiss.normalize_L2(embs)
             self.index = faiss.IndexFlatIP(embs.shape[1])
         else:
-            # ST path already normalized in _encode_texts_st
+           
             self.index = faiss.IndexFlatIP(embs.shape[1])
 
         self.index.add(embs.astype("float32"))
@@ -221,7 +219,7 @@ class LlamaRetriever:
         faiss.write_index(self.index, f"{base_path}.faiss")
         metadata = {
             "doc_ids": self.doc_ids,
-            "documents": self.documents,       # stored so we can return texts directly
+            "documents": self.documents,       
             "backend": self.backend,
             "model_name": self.model_name if self.backend == "llama" else self.st_model_name,
             "max_length": self.max_length,
@@ -272,7 +270,7 @@ class LlamaRetriever:
         self.documents = [id2text[i] for i in self.doc_ids]
         logger.info(f"Loaded external index with {len(self.documents)} docs")
 
-    # ---------------------------- RETRIEVAL APIS ----------------------------
+    
 
     def retrieve(self, query: str, k: int = 5) -> List[str]:
         if self.index is None:
